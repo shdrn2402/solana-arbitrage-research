@@ -194,9 +194,11 @@ src/
 ## How It Works
 
 1. **Opportunity search** (`arbitrage_finder.py`)
-   - Generates exchange cycles (A → B → A, A → B → C → A)
+   - Evaluates predefined exchange cycles (e.g. A → B → A, A → B → C → A)
    - Gets quotes via Jupiter Quote API
    - Calculates profit accounting for fees and slippage
+   - The project intentionally uses a limited, predefined set of cycles
+     to simplify diagnostics and architectural research.
 
 2. **Risk check** (`risk_manager.py`)
    - Checks all limits
