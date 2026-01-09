@@ -112,6 +112,18 @@ async def main():
     priority_fee = int(os.getenv('PRIORITY_FEE_LAMPORTS', '10000'))
     use_jito = os.getenv('USE_JITO', 'false').lower() == 'true'
     
+    # Slippage configuration
+    slippage_bps = int(os.getenv('SLIPPAGE_BPS', '50'))
+    diagnostic_slippage_bps = int(os.getenv('DIAGNOSTIC_SLIPPAGE_BPS', '500'))
+    
+    # Validate slippage: SLIPPAGE_BPS must be <= MAX_SLIPPAGE_BPS
+    if slippage_bps > risk_config.max_slippage_bps:
+        logger.warning(
+            f"SLIPPAGE_BPS ({slippage_bps}) exceeds MAX_SLIPPAGE_BPS ({risk_config.max_slippage_bps}). "
+            f"Using MAX_SLIPPAGE_BPS as limit."
+        )
+        slippage_bps = risk_config.max_slippage_bps
+    
     # Load wallet
     wallet = load_wallet()
     if wallet is None and mode != 'scan':
@@ -152,7 +164,8 @@ async def main():
         min_profit_usd=risk_config.min_profit_usdc,  # Use min_profit_usdc from RiskConfig
         max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
         max_cycles=arbitrage_config.get('max_cycles', 100),
-        quote_timeout=arbitrage_config.get('quote_timeout', 5.0)
+        quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
+        slippage_bps=slippage_bps
     )
     
     # Initialize trader with mode for safety checks
@@ -163,7 +176,8 @@ async def main():
         finder,
         priority_fee_lamports=priority_fee,
         use_jito=use_jito,
-        mode=mode  # Pass mode for strict checking
+        mode=mode,  # Pass mode for strict checking
+        slippage_bps=slippage_bps
     )
     
     # DIAGNOSTIC MODE: Test if Jupiter can return routes at all
@@ -180,13 +194,13 @@ async def main():
         
         logger.info(f"Request: SOL → USDC")
         logger.info(f"Amount: {test_amount / 1e9:.2f} SOL")
-        logger.info(f"Parameters: slippageBps=500, onlyDirectRoutes=false")
+        logger.info(f"Parameters: slippageBps={diagnostic_slippage_bps}, onlyDirectRoutes=false")
         
         quote = await jupiter.get_quote(
             input_mint=sol_mint,
             output_mint=usdc_mint,
             amount=test_amount,
-            slippage_bps=500,
+            slippage_bps=diagnostic_slippage_bps,
             only_direct_routes=False
         )
         

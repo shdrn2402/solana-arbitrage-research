@@ -26,7 +26,8 @@ class Trader:
         arbitrage_finder: ArbitrageFinder,
         priority_fee_lamports: int = 0,
         use_jito: bool = False,
-        mode: str = 'scan'  # 'scan', 'simulate', or 'live'
+        mode: str = 'scan',  # 'scan', 'simulate', or 'live'
+        slippage_bps: int = 50
     ):
         self.jupiter = jupiter_client
         self.solana = solana_client
@@ -36,6 +37,7 @@ class Trader:
         self.use_jito = use_jito
         self.mode = mode.lower()
         self.trade_in_progress = False  # Protection against parallel trades
+        self.slippage_bps = slippage_bps
     
     async def scan_opportunities(
         self,
@@ -85,7 +87,8 @@ class Trader:
         swap_response = await self.jupiter.get_swap_transaction(
             first_quote,
             user_pubkey,
-            priority_fee_lamports=self.priority_fee
+            priority_fee_lamports=self.priority_fee,
+            slippage_bps=self.slippage_bps
         )
         
         if swap_response is None:
@@ -141,7 +144,7 @@ class Trader:
             can_open, reason = self.risk.can_open_position(
                 opportunity.initial_amount,
                 opportunity.profit_bps,
-                slippage_bps=50,  # from config
+                slippage_bps=self.slippage_bps,  # from config
                 expected_profit_usdc=opportunity.profit_usd  # Note: profit_usd is actually USDC
             )
             
@@ -182,7 +185,8 @@ class Trader:
             swap_response = await self.jupiter.get_swap_transaction(
                 first_quote,
                 user_pubkey,
-                priority_fee_lamports=self.priority_fee
+                priority_fee_lamports=self.priority_fee,
+                slippage_bps=self.slippage_bps
             )
             
             if swap_response is None:

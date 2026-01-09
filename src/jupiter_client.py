@@ -250,7 +250,8 @@ class JupiterClient:
         priority_fee_lamports: int = 0,
         wrap_unwrap_sol: bool = True,
         dynamic_compute_unit_limit: bool = True,
-        dynamic_slippage: Optional[Dict[str, Any]] = None
+        dynamic_slippage: Optional[Dict[str, Any]] = None,
+        slippage_bps: int = 50
     ) -> Optional[JupiterSwapResponse]:
         """
         Get swap transaction from Jupiter API.
@@ -262,6 +263,7 @@ class JupiterClient:
             wrap_unwrap_sol: Auto wrap/unwrap SOL
             dynamic_compute_unit_limit: Use dynamic compute unit limit
             dynamic_slippage: Dynamic slippage configuration
+            slippage_bps: Slippage in basis points (default: 50)
         
         Returns:
             JupiterSwapResponse or None if swap transaction build fails
@@ -275,7 +277,7 @@ class JupiterClient:
                 "outAmount": str(quote.out_amount),
                 "otherAmountThreshold": str(quote.out_amount),
                 "swapMode": "ExactIn",
-                "slippageBps": 50,
+                "slippageBps": slippage_bps,
                 "priceImpactPct": quote.price_impact_pct,
                 "routePlan": quote.route_plan
             },

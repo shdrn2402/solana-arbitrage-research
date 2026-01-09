@@ -71,7 +71,8 @@ class ArbitrageFinder:
         min_profit_usd: float = 0.1,
         max_cycle_length: int = 4,
         max_cycles: int = 100,
-        quote_timeout: float = 5.0
+        quote_timeout: float = 5.0,
+        slippage_bps: int = 50
     ):
         self.jupiter = jupiter_client
         self.tokens = tokens
@@ -80,6 +81,7 @@ class ArbitrageFinder:
         self.max_cycle_length = max_cycle_length
         self.max_cycles = max_cycles
         self.quote_timeout = quote_timeout
+        self.slippage_bps = slippage_bps
     
     async def find_opportunities(
         self,
@@ -196,7 +198,7 @@ class ArbitrageFinder:
                 output_mint = cycle[i + 1]
                 
                 quote = await asyncio.wait_for(
-                    self.jupiter.get_quote(input_mint, output_mint, current_amount, slippage_bps=50),
+                    self.jupiter.get_quote(input_mint, output_mint, current_amount, slippage_bps=self.slippage_bps),
                     timeout=self.quote_timeout
                 )
                 
