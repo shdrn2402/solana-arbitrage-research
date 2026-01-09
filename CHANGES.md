@@ -164,6 +164,26 @@
 - `src/jupiter_client.py`: Replaced hardcoded `"slippageBps": 50` with parameter value
 - `env.example`: Added `SLIPPAGE_BPS=50` and `DIAGNOSTIC_SLIPPAGE_BPS=500` examples
 
+### 11. Improved Slippage Validation and Logging ✅
+
+**Problem**: When `SLIPPAGE_BPS` was set to a value greater than default `MAX_SLIPPAGE_BPS` (50) without explicitly setting `MAX_SLIPPAGE_BPS`, the value was silently capped without clear warnings or instructions.
+
+**Fix**:
+- Added explicit check for `MAX_SLIPPAGE_BPS` being set in `.env` (vs. using default)
+- Warning logged when `MAX_SLIPPAGE_BPS` is not explicitly set but `SLIPPAGE_BPS` is set (preserves backward compatibility: no warning if both use defaults)
+- Changed validation error from `warning` to `error` level when `SLIPPAGE_BPS` exceeds `MAX_SLIPPAGE_BPS`
+- Enhanced error message with clear instructions: "Either increase MAX_SLIPPAGE_BPS in .env or decrease SLIPPAGE_BPS"
+- Added final validation summary showing:
+  - If slippage was adjusted: shows original and final values
+  - If explicitly configured: shows current configuration values
+- Improved `env.example` comments to clarify relationship between `MAX_SLIPPAGE_BPS` (risk limit) and `SLIPPAGE_BPS` (actual value used)
+
+**Files**:
+- `src/main.py`: Added explicit checks for `MAX_SLIPPAGE_BPS` and `SLIPPAGE_BPS` being set in environment
+- `src/main.py`: Enhanced validation logic with warnings for missing `MAX_SLIPPAGE_BPS` and errors for exceeding limits
+- `src/main.py`: Added final validation summary logging with adjusted/current values
+- `env.example`: Improved comments for `MAX_SLIPPAGE_BPS` and `SLIPPAGE_BPS` to clarify their relationship
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -176,3 +196,4 @@
 ✅ Jupiter API uses correct endpoint format (/swap/v1/quote)
 ✅ Minimal scan configuration: 4 tokens, 6 fixed cycles, sequential processing with delays (quota-safe)
 ✅ Slippage is configurable via `.env` (`SLIPPAGE_BPS`, `DIAGNOSTIC_SLIPPAGE_BPS`) with validation against `MAX_SLIPPAGE_BPS`
+✅ Improved slippage validation and logging: explicit warnings when `MAX_SLIPPAGE_BPS` is not set, detailed error messages with instructions, final configuration summary

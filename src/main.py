@@ -98,12 +98,17 @@ async def main():
     else:
         min_profit_usdc = config.get('arbitrage', {}).get('min_profit_usd', 0.1)
     
+    # Read MAX_SLIPPAGE_BPS with check for explicit setting
+    max_slippage_bps_env = os.getenv('MAX_SLIPPAGE_BPS')
+    max_slippage_bps_explicitly_set = 'MAX_SLIPPAGE_BPS' in os.environ
+    max_slippage_bps_value = int(max_slippage_bps_env) if max_slippage_bps_env else 50
+    
     risk_config = RiskConfig(
         max_position_size_percent=float(os.getenv('MAX_POSITION_SIZE_PERCENT', '10.0')),
         max_position_size_absolute_usdc=max_position_absolute_usdc,
         min_profit_usdc=min_profit_usdc,  # PRIMARY check in USDC
         min_profit_bps=int(os.getenv('MIN_PROFIT_BPS', '50')),  # Secondary filter (can be 0 to disable)
-        max_slippage_bps=int(os.getenv('MAX_SLIPPAGE_BPS', '50')),
+        max_slippage_bps=max_slippage_bps_value,
         max_active_positions=int(os.getenv('MAX_ACTIVE_POSITIONS', '1')),
         sol_price_usdc=sol_price_usdc
     )
@@ -112,17 +117,42 @@ async def main():
     priority_fee = int(os.getenv('PRIORITY_FEE_LAMPORTS', '10000'))
     use_jito = os.getenv('USE_JITO', 'false').lower() == 'true'
     
-    # Slippage configuration
-    slippage_bps = int(os.getenv('SLIPPAGE_BPS', '50'))
+    # Slippage configuration - save original value before validation
+    slippage_bps_env = os.getenv('SLIPPAGE_BPS')
+    slippage_bps_explicitly_set = 'SLIPPAGE_BPS' in os.environ
+    slippage_bps_original = int(slippage_bps_env) if slippage_bps_env else 50
+    slippage_bps = slippage_bps_original
     diagnostic_slippage_bps = int(os.getenv('DIAGNOSTIC_SLIPPAGE_BPS', '500'))
+    
+    # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
+    # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
+    if not max_slippage_bps_explicitly_set and slippage_bps_explicitly_set:
+        logger.warning(
+            "MAX_SLIPPAGE_BPS not set in .env, using default value 50. "
+            "If SLIPPAGE_BPS > 50, it will be automatically capped."
+        )
     
     # Validate slippage: SLIPPAGE_BPS must be <= MAX_SLIPPAGE_BPS
     if slippage_bps > risk_config.max_slippage_bps:
-        logger.warning(
+        logger.error(
             f"SLIPPAGE_BPS ({slippage_bps}) exceeds MAX_SLIPPAGE_BPS ({risk_config.max_slippage_bps}). "
-            f"Using MAX_SLIPPAGE_BPS as limit."
+            f"Either increase MAX_SLIPPAGE_BPS in .env or decrease SLIPPAGE_BPS. "
+            f"Using MAX_SLIPPAGE_BPS as limit for safety."
         )
         slippage_bps = risk_config.max_slippage_bps
+    
+    # Final validation summary - show if slippage was adjusted or if explicitly configured
+    if slippage_bps != slippage_bps_original:
+        logger.warning(
+            f"Slippage adjusted: MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
+            f"SLIPPAGE_BPS={slippage_bps} (adjusted from {slippage_bps_original} in .env)"
+        )
+    elif max_slippage_bps_explicitly_set or slippage_bps_explicitly_set:
+        # Log current configuration if at least one variable was explicitly set
+        logger.info(
+            f"Slippage configuration: MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
+            f"SLIPPAGE_BPS={slippage_bps}"
+        )
     
     # Load wallet
     wallet = load_wallet()
