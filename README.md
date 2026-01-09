@@ -103,49 +103,58 @@ Additional settings:
 
 ## Usage
 
-### SCAN Mode (read-only)
+### Scan Mode
 
-Search for arbitrage opportunities without execution:
+Read-only mode for analyzing potential arbitrage paths without executing transactions:
 
 ```bash
-# Option 1: via run.py
-MODE=scan python run.py
-
-# Option 2: via module
-MODE=scan python -m src.main
+python run.py scan
 ```
 
-Output:
+Output (if available):
 - List of found opportunities
 - Profit in bps and USD
-- Exchange cycles (A → B → A)
+- Exchange cycles
 
-### SIMULATE Mode (simulation)
+### Simulate Mode
 
-Search for opportunities and simulate transactions without sending:
+Simulation mode attempts to execute the trading logic without sending real transactions.
+Intended for research and testing purposes:
 
 ```bash
 # Make sure WALLET_PRIVATE_KEY is set in .env
-MODE=simulate python run.py
+python run.py simulate
 ```
 
 Required:
 - Configured `WALLET_PRIVATE_KEY` in .env
 - Balance on wallet (for simulation)
 
-### LIVE Mode (real execution)
+### Live Mode
 
 ⚠️ **WARNING**: Live mode sends real transactions to the network!
 
+Live mode attempts to execute arbitrage transactions on-chain.
+Disabled by default and not guaranteed to function due to aggregator API limitations.
+
 ```bash
 # Make sure all settings are verified!
-MODE=live python run.py
+python run.py live
 ```
 
 Required:
 - Configured `WALLET_PRIVATE_KEY` in .env
 - SOL on wallet for trading
 - Thorough verification of all limits
+
+### Diagnostic Mode
+
+Runs a single direct quote request to verify that the aggregator API
+can build swap routes, then exits immediately.
+
+```bash
+DIAGNOSTIC_MODE=true python run.py
+```
 
 ## Risk & Capital Management
 
