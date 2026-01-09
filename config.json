@@ -1,0 +1,24 @@
+{
+  "tokens": {
+    "SOL": "So11111111111111111111111111111111111111112",
+    "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "mSOL": "mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So",
+    "jitoSOL": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn",
+    "bSOL": "bSo13r4TkiE4KumL71LsHTPpL2euBYLFx6h9HP3piy1c",
+    "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "ORCA": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu4QHxOrKP2bU",
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+  },
+  "arbitrage": {
+    "min_profit_usd": 0.1,
+    "max_cycle_length": 4,
+    "max_cycles": 100,
+    "quote_timeout": 5.0,
+    "max_quote_age_seconds": 2
+  },
+  "simulation": {
+    "enabled": true,
+    "require_exact_match": false,
+    "max_simulation_deviation_bps": 100
+  }
+}

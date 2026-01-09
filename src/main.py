@@ -1,0 +1,358 @@
+"""
+Main entry point for Solana arbitrage bot.
+"""
+import asyncio
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+import dotenv
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+
+from .jupiter_client import JupiterClient
+from .solana_client import SolanaClient
+from .risk_manager import RiskManager, RiskConfig
+from .arbitrage_finder import ArbitrageFinder
+from .trader import Trader
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('arbitrage_bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def load_config() -> dict:
+    """Load configuration from .env and config.json."""
+    # Load .env
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        dotenv.load_dotenv(env_path)
+    else:
+        logger.warning(f".env file not found at {env_path}")
+    
+    # Load config.json
+    config_path = Path(__file__).parent.parent / 'config.json'
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    else:
+        logger.warning(f"config.json not found at {config_path}")
+        config = {}
+    
+    return config
+
+
+def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
+    """Load wallet from private key."""
+    if not private_key_str:
+        private_key_str = os.getenv('WALLET_PRIVATE_KEY')
+    
+    if not private_key_str:
+        logger.warning("No wallet private key provided")
+        return None
+    
+    try:
+        # Decode base58 private key
+        import base58
+        key_bytes = base58.b58decode(private_key_str)
+        return Keypair.from_bytes(key_bytes)
+    except Exception as e:
+        logger.error(f"Error loading wallet: {e}")
+        return None
+
+
+async def main():
+    """Main function."""
+    logger.info("Starting Solana Arbitrage Bot")
+    
+    # Load configuration
+    config = load_config()
+    
+    # Environment variables
+    rpc_url = os.getenv('RPC_URL', 'https://api.mainnet-beta.solana.com')
+    # Jupiter API URL: if not set, client will use fallback mechanism
+    # If set explicitly, that URL will be used (no fallback)
+    jupiter_api_url = os.getenv('JUPITER_API_URL')  # None = use fallback
+    jupiter_api_key = os.getenv('JUPITER_API_KEY')  # Optional API key for authenticated requests
+    mode = os.getenv('MODE', 'scan').lower()
+    
+    # Risk config - all limits in USDC for consistency
+    sol_price_usdc = float(os.getenv('SOL_PRICE_USDC', '100.0'))  # Default SOL price
+    max_position_absolute_sol = float(os.getenv('MAX_POSITION_SIZE_ABSOLUTE', '1.0'))
+    max_position_absolute_usdc = max_position_absolute_sol * sol_price_usdc  # Convert to USDC
+    
+    # Min profit: env takes precedence, then config.json, then default
+    min_profit_usdc_env = os.getenv('MIN_PROFIT_USDC')
+    if min_profit_usdc_env:
+        min_profit_usdc = float(min_profit_usdc_env)
+    else:
+        min_profit_usdc = config.get('arbitrage', {}).get('min_profit_usd', 0.1)
+    
+    risk_config = RiskConfig(
+        max_position_size_percent=float(os.getenv('MAX_POSITION_SIZE_PERCENT', '10.0')),
+        max_position_size_absolute_usdc=max_position_absolute_usdc,
+        min_profit_usdc=min_profit_usdc,  # PRIMARY check in USDC
+        min_profit_bps=int(os.getenv('MIN_PROFIT_BPS', '50')),  # Secondary filter (can be 0 to disable)
+        max_slippage_bps=int(os.getenv('MAX_SLIPPAGE_BPS', '50')),
+        max_active_positions=int(os.getenv('MAX_ACTIVE_POSITIONS', '1')),
+        sol_price_usdc=sol_price_usdc
+    )
+    
+    # Priority fee
+    priority_fee = int(os.getenv('PRIORITY_FEE_LAMPORTS', '10000'))
+    use_jito = os.getenv('USE_JITO', 'false').lower() == 'true'
+    
+    # Load wallet
+    wallet = load_wallet()
+    if wallet is None and mode != 'scan':
+        logger.error("Wallet required for simulate/live modes")
+        return
+    
+    # Initialize clients
+    jupiter = JupiterClient(jupiter_api_url, api_key=jupiter_api_key)
+    solana = SolanaClient(rpc_url, wallet)
+    
+    # Initialize risk manager
+    risk_manager = RiskManager(risk_config)
+    
+    # Update wallet balance
+    if wallet:
+        balance = await solana.get_balance()
+        risk_manager.update_wallet_balance(balance)
+        logger.info(f"Wallet balance: {balance / 1e9:.4f} SOL")
+    
+    # Get tokens from config
+    tokens_config = config.get('tokens', {})
+    tokens = list(tokens_config.values())
+    if not tokens:
+        # Default tokens
+        tokens = [
+            "So11111111111111111111111111111111111111112",  # SOL
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        ]
+    
+    # Initialize arbitrage finder
+    arbitrage_config = config.get('arbitrage', {})
+    finder = ArbitrageFinder(
+        jupiter,
+        tokens,
+        min_profit_bps=risk_config.min_profit_bps,
+        min_profit_usd=risk_config.min_profit_usdc,  # Use min_profit_usdc from RiskConfig
+        max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
+        max_cycles=arbitrage_config.get('max_cycles', 100),
+        quote_timeout=arbitrage_config.get('quote_timeout', 5.0)
+    )
+    
+    # Initialize trader with mode for safety checks
+    trader = Trader(
+        jupiter,
+        solana,
+        risk_manager,
+        finder,
+        priority_fee_lamports=priority_fee,
+        use_jito=use_jito,
+        mode=mode  # Pass mode for strict checking
+    )
+    
+    # DIAGNOSTIC MODE: Test if Jupiter can return routes at all
+    # Set DIAGNOSTIC_MODE=true in .env to enable
+    diagnostic_mode = os.getenv('DIAGNOSTIC_MODE', 'false').lower() == 'true'
+    if diagnostic_mode:
+        logger.info("=" * 60)
+        logger.info("DIAGNOSTIC MODE: Testing Jupiter route capability")
+        logger.info("=" * 60)
+        
+        sol_mint = "So11111111111111111111111111111111111111112"
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        test_amount = 1_000_000_000  # 1 SOL
+        
+        logger.info(f"Request: SOL → USDC")
+        logger.info(f"Amount: {test_amount / 1e9:.2f} SOL")
+        logger.info(f"Parameters: slippageBps=500, onlyDirectRoutes=false")
+        
+        quote = await jupiter.get_quote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            amount=test_amount,
+            slippage_bps=500,
+            only_direct_routes=False
+        )
+        
+        if quote:
+            logger.info("✓ Quote received successfully")
+            logger.info(f"  Input: {quote.in_amount / 1e9:.6f} SOL")
+            logger.info(f"  Output: {quote.out_amount / 1e6:.2f} USDC")
+            logger.info(f"  Price impact: {quote.price_impact_pct:.4f}%")
+            
+            if quote.route_plan:
+                logger.info(f"✓ Route plan found: {len(quote.route_plan)} hops/steps")
+                for i, hop in enumerate(quote.route_plan, 1):
+                    # Log hop details safely
+                    hop_info = f"Hop {i}: "
+                    if isinstance(hop, dict):
+                        swap_info = hop.get('swapInfo', {})
+                        if swap_info:
+                            amm_key = swap_info.get('ammKey', 'N/A')
+                            hop_info += f"AMM={amm_key[:16]}..." if len(amm_key) > 16 else f"AMM={amm_key}"
+                        else:
+                            hop_info += str(hop)[:50]
+                    else:
+                        hop_info += str(hop)[:50]
+                    logger.info(f"  {hop_info}")
+            else:
+                logger.warning("✗ Route plan is empty (no hops/steps)")
+        else:
+            logger.error("✗ No quote received from Jupiter")
+            logger.error("  Jupiter cannot build routes for SOL → USDC")
+        
+        logger.info("=" * 60)
+        logger.info("Diagnostic test complete. Exiting.")
+        logger.info("Set DIAGNOSTIC_MODE=false to run normal scan mode")
+        logger.info("=" * 60)
+        
+        # Cleanup and exit
+        await jupiter.close()
+        await solana.close()
+        return
+    
+    # Determine starting token and amount
+    # Prefer SOL or USDC as base token for cycles
+    sol_mint = "So11111111111111111111111111111111111111112"
+    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    
+    if sol_mint in tokens:
+        start_token = sol_mint
+    elif usdc_mint in tokens:
+        start_token = usdc_mint
+    else:
+        start_token = tokens[0]  # Fallback to first token
+    
+    available_balance = risk_manager.get_available_balance() if wallet else 1_000_000_000  # 1 SOL default
+    # Convert max_position_size_absolute_usdc back to SOL for test_amount calculation
+    max_position_absolute_sol_calc = risk_config.max_position_size_absolute_usdc / risk_config.sol_price_usdc
+    test_amount = min(
+        int(available_balance * risk_config.max_position_size_percent / 100),
+        int(max_position_absolute_sol_calc * 1e9)
+    )
+    
+    try:
+        if mode == 'scan':
+            logger.info("Mode: SCAN (read-only)")
+            opportunities = await trader.scan_opportunities(
+                start_token,
+                test_amount,
+                max_opportunities=10
+            )
+            
+            if opportunities:
+                logger.info(f"\nFound {len(opportunities)} profitable opportunities:")
+                for i, opp in enumerate(opportunities, 1):
+                    logger.info(
+                        f"\n{i}. Cycle: {' -> '.join(opp.cycle)}"
+                        f"\n   Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f})"
+                        f"\n   Initial: {opp.initial_amount / 1e9:.6f} SOL"
+                        f"\n   Final: {opp.final_amount / 1e9:.6f} SOL"
+                        f"\n   Price Impact: {opp.price_impact_total:.2f}%"
+                    )
+            else:
+                logger.info("No profitable opportunities found")
+        
+        elif mode == 'simulate':
+            logger.info("Mode: SIMULATE")
+            if not wallet:
+                logger.error("Wallet required for simulation")
+                return
+            
+            opportunities = await trader.scan_opportunities(
+                start_token,
+                test_amount,
+                max_opportunities=5
+            )
+            
+            for opp in opportunities:
+                user_pubkey = str(wallet.pubkey())
+                success, error, sim_result = await trader.simulate_opportunity(opp, user_pubkey)
+                
+                if success:
+                    logger.info(f"Simulation successful for cycle: {' -> '.join(opp.cycle)}")
+                    logger.debug(f"Simulation result: {sim_result}")
+                else:
+                    logger.warning(f"Simulation failed: {error}")
+        
+        elif mode == 'live':
+            logger.info("Mode: LIVE (real trading)")
+            if not wallet:
+                logger.error("Wallet required for live trading")
+                return
+            
+            # STRICT WARNING: Live mode sends real transactions
+            logger.warning("=" * 60)
+            logger.warning("LIVE MODE ENABLED - REAL TRANSACTIONS WILL BE SENT!")
+            logger.warning("=" * 60)
+            
+            # Additional confirmation check (can be removed if automated)
+            import time
+            logger.warning("Starting live mode in 3 seconds... Press Ctrl+C to cancel")
+            await asyncio.sleep(3)
+            
+            # Continuous loop
+            while True:
+                try:
+                    # Update balance
+                    balance = await solana.get_balance()
+                    risk_manager.update_wallet_balance(balance)
+                    
+                    # Find opportunities
+                    opportunities = await trader.scan_opportunities(
+                        start_token,
+                        test_amount,
+                        max_opportunities=1
+                    )
+                    
+                    if opportunities:
+                        opp = opportunities[0]
+                        user_pubkey = str(wallet.pubkey())
+                        
+                        # Execute
+                        success, error, tx_sig = await trader.execute_opportunity(opp, user_pubkey)
+                        
+                        if success:
+                            logger.info(f"Successfully executed arbitrage: {tx_sig}")
+                        else:
+                            logger.warning(f"Execution failed: {error}")
+                    else:
+                        logger.info("No opportunities found, waiting...")
+                    
+                    # Wait before next iteration
+                    await asyncio.sleep(5)
+                    
+                except KeyboardInterrupt:
+                    logger.info("Stopping bot...")
+                    break
+                except Exception as e:
+                    logger.error(f"Error in live loop: {e}")
+                    await asyncio.sleep(5)
+        
+        else:
+            logger.error(f"Unknown mode: {mode}. Use: scan, simulate, or live")
+    
+    finally:
+        # Cleanup
+        await jupiter.close()
+        await solana.close()
+        logger.info("Bot stopped")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())

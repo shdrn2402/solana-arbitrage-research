@@ -1,0 +1,6 @@
+solana>=0.30.0
+solders>=0.18.0
+httpx>=0.25.0
+python-dotenv>=1.0.0
+base58>=2.1.1
+construct>=2.10.70

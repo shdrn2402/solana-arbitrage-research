@@ -1,0 +1,176 @@
+"""
+Solana RPC client for balance checks, simulation, and transaction sending.
+"""
+import asyncio
+import base58
+import logging
+from typing import Optional, Dict, Any
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.rpc.responses import GetBalanceResp
+from solders.transaction import Transaction
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
+from solana.rpc.types import TxOpts
+
+logger = logging.getLogger(__name__)
+
+
+class SolanaClient:
+    """Client for Solana RPC operations."""
+    
+    def __init__(self, rpc_url: str, wallet_keypair: Optional[Keypair] = None):
+        self.rpc_url = rpc_url
+        self.client = AsyncClient(rpc_url)
+        self.wallet = wallet_keypair
+    
+    async def get_balance(self, pubkey: Optional[Pubkey] = None) -> int:
+        """
+        Get SOL balance in lamports.
+        
+        Args:
+            pubkey: Public key (defaults to wallet)
+        
+        Returns:
+            Balance in lamports
+        """
+        if pubkey is None:
+            if self.wallet is None:
+                raise ValueError("No wallet or pubkey provided")
+            pubkey = self.wallet.pubkey()
+        
+        try:
+            resp: GetBalanceResp = await self.client.get_balance(pubkey, commitment=Confirmed)
+            return resp.value
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
+            return 0
+    
+    async def simulate_transaction(
+        self,
+        transaction_base64: str,
+        commitment: str = "confirmed"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Simulate a transaction.
+        
+        Args:
+            transaction_base64: Base64-encoded transaction
+            commitment: Commitment level
+        
+        Returns:
+            Simulation result dict or None
+        """
+        try:
+            # Decode transaction
+            tx_bytes = base58.b58decode(transaction_base64)
+            transaction = Transaction.from_bytes(tx_bytes)
+            
+            # Simulate
+            result = await self.client.simulate_transaction(
+                transaction,
+                commitment=commitment
+            )
+            
+            if result.value.err:
+                logger.warning(f"Simulation error: {result.value.err}")
+                return None
+            
+            return {
+                "err": result.value.err,
+                "logs": result.value.logs,
+                "accounts": result.value.accounts,
+                "units_consumed": result.value.units_consumed,
+                "return_data": result.value.return_data
+            }
+            
+        except Exception as e:
+            logger.error(f"Error simulating transaction: {e}")
+            return None
+    
+    async def send_transaction(
+        self,
+        transaction_base64: str,
+        skip_preflight: bool = False,
+        max_retries: int = 3
+    ) -> Optional[str]:
+        """
+        Send a transaction.
+        
+        Args:
+            transaction_base64: Base64-encoded transaction
+            skip_preflight: Skip preflight checks
+            max_retries: Maximum retry attempts
+        
+        Returns:
+            Transaction signature (base58) or None
+        """
+        try:
+            # Decode transaction
+            tx_bytes = base58.b58decode(transaction_base64)
+            transaction = Transaction.from_bytes(tx_bytes)
+            
+            # Sign if wallet is available
+            if self.wallet:
+                transaction.sign(self.wallet)
+            
+            # Send with retries
+            for attempt in range(max_retries):
+                try:
+                    opts = TxOpts(
+                        skip_preflight=skip_preflight,
+                        max_retries=0  # We handle retries ourselves
+                    )
+                    result = await self.client.send_transaction(transaction, opts=opts)
+                    
+                    if result.value:
+                        sig = str(result.value)
+                        logger.info(f"Transaction sent: {sig}")
+                        return sig
+                    else:
+                        logger.warning(f"Transaction send returned no signature (attempt {attempt + 1})")
+                        
+                except Exception as e:
+                    logger.warning(f"Transaction send attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.5)
+                    else:
+                        raise
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error sending transaction: {e}")
+            return None
+    
+    async def confirm_transaction(
+        self,
+        signature: str,
+        commitment: str = "confirmed",
+        timeout: float = 30.0
+    ) -> bool:
+        """
+        Wait for transaction confirmation.
+        
+        Args:
+            signature: Transaction signature
+            commitment: Commitment level
+            timeout: Timeout in seconds
+        
+        Returns:
+            True if confirmed, False otherwise
+        """
+        try:
+            result = await self.client.confirm_transaction(
+                signature,
+                commitment=commitment,
+                timeout=timeout
+            )
+            return result.value[0].confirmation_status is not None
+        except Exception as e:
+            logger.error(f"Error confirming transaction: {e}")
+            return False
+    
+    async def close(self):
+        """Close RPC client."""
+        await self.client.close()
