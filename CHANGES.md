@@ -120,6 +120,25 @@
 - `src/jupiter_client.py`: Updated all endpoint paths to use `/swap/v1/` format
 - `src/jupiter_client.py`: Enhanced error handling for 404 responses
 
+### 9. Quota-Safe Minimal Scan Configuration ✅
+
+**Problem**: High Jupiter API quota consumption due to large token universe and combinatorial cycle generation.
+
+**Fix**:
+- Limited token universe to exactly 4 tokens: SOL, USDC, USDT, JUP
+- Replaced dynamic cycle generation with fixed list of 6 predefined cycles
+- Removed parallelism: cycles checked sequentially (one at a time)
+- Added 200ms delays between quote requests to avoid quota spikes
+- Single pass per scan run (no iterations/repeats)
+
+**Files**:
+- `config.json`: Reduced tokens to 4 (SOL, USDC, USDT, JUP)
+- `src/arbitrage_finder.py`: Added `FIXED_CYCLES` constant with 6 predefined cycles
+- `src/arbitrage_finder.py`: Replaced parallel batch processing with sequential checking
+- `src/arbitrage_finder.py`: Added delays between cycles and within cycle legs
+- `src/main.py`: Added quota-safe scan info log message
+- `src/main.py`: Updated default tokens to include JUP
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -130,3 +149,4 @@
 ✅ All RiskConfig attributes synchronized (no AttributeError)
 ✅ Jupiter API uses working DNS endpoint (api.jup.ag)
 ✅ Jupiter API uses correct endpoint format (/swap/v1/quote)
+✅ Minimal scan configuration: 4 tokens, 6 fixed cycles, sequential processing with delays (quota-safe)

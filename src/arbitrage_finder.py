@@ -34,6 +34,35 @@ class ArbitrageOpportunity:
 class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
+    # Fixed minimal cycle set for quota-safe scanning
+    # Only 6 predefined cycles with 4 tokens: SOL, USDC, USDT, JUP
+    FIXED_CYCLES = [
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112",  # SOL
+         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
+        ["Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]  # USDT
+    ]
+    
     def __init__(
         self,
         jupiter_client: JupiterClient,
@@ -71,33 +100,20 @@ class ArbitrageFinder:
         """
         opportunities = []
         
-        # Generate cycles: A -> B -> A, A -> B -> C -> A, etc.
-        cycles = self._generate_cycles(start_token, self.tokens, self.max_cycle_length)
+        # Use fixed minimal cycle set (quota-safe: only 6 cycles)
+        cycles = self.FIXED_CYCLES
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
         
-        # Check each cycle
-        tasks = []
+        # Check each cycle sequentially (no parallelism) with delays to avoid quota burn
         for cycle in cycles:
-            task = self._check_cycle(cycle, amount)
-            tasks.append(task)
-        
-        # Execute in batches to avoid overwhelming API
-        batch_size = 10
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i:i + batch_size]
-            results = await asyncio.gather(*batch, return_exceptions=True)
+            result = await self._check_cycle(cycle, amount)
             
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Cycle check failed: {result}")
-                    continue
-                if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
-                    opportunities.append(result)
+            if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
+                opportunities.append(result)
             
-            # Small delay between batches
-            if i + batch_size < len(tasks):
-                await asyncio.sleep(0.1)
+            # Delay between cycles to avoid quota spikes (150-250ms)
+            await asyncio.sleep(0.2)
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.profit_bps, reverse=True)
@@ -174,7 +190,7 @@ class ArbitrageFinder:
         current_amount = initial_amount
         
         try:
-            # Get quotes for each leg
+            # Get quotes for each leg sequentially with delays
             for i in range(len(cycle) - 1):
                 input_mint = cycle[i]
                 output_mint = cycle[i + 1]
@@ -189,6 +205,10 @@ class ArbitrageFinder:
                 
                 quotes.append(quote)
                 current_amount = quote.out_amount
+                
+                # Delay between quote requests within a cycle (150-250ms)
+                if i < len(cycle) - 2:  # Don't delay after last leg
+                    await asyncio.sleep(0.2)
             
             # Calculate profit
             final_amount = current_amount

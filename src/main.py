@@ -131,15 +131,16 @@ async def main():
         risk_manager.update_wallet_balance(balance)
         logger.info(f"Wallet balance: {balance / 1e9:.4f} SOL")
     
-    # Get tokens from config
+    # Get tokens from config (minimal set: SOL, USDC, USDT, JUP)
     tokens_config = config.get('tokens', {})
     tokens = list(tokens_config.values())
     if not tokens:
-        # Default tokens
+        # Default minimal tokens (quota-safe)
         tokens = [
             "So11111111111111111111111111111111111111112",  # SOL
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
             "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
         ]
     
     # Initialize arbitrage finder
@@ -249,6 +250,7 @@ async def main():
     try:
         if mode == 'scan':
             logger.info("Mode: SCAN (read-only)")
+            logger.info("Minimal scan: tokens=4 cycles=6 (quota-safe)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
