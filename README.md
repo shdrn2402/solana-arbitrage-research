@@ -67,9 +67,6 @@ RPC_URL=https://api.mainnet-beta.solana.com
 # Wallet private key (base58)
 WALLET_PRIVATE_KEY=your_private_key_here
 
-# Operation mode: scan, simulate, live
-MODE=scan
-
 # Risk Management
 MAX_POSITION_SIZE_PERCENT=10.0      # Maximum position size (% of balance)
 MAX_POSITION_SIZE_ABSOLUTE=1.0      # Maximum position size (SOL)
@@ -179,7 +176,7 @@ The bot includes a comprehensive risk management system:
    - Tracking of locked balance
 
 5. **Simulation**
-   - Mandatory simulation before execution
+   - Simulation support before execution
    - Validation of simulation results
 
 ### Balance Management
@@ -260,7 +257,7 @@ src/
 - Make sure RPC is accessible
 
 ### No opportunities found
-- This is normal - arbitrage opportunities are rare
+- This is normal behavior. Public aggregator APIs may return no routes even for liquid pairs.
 - Try increasing `MIN_PROFIT_BPS` or decreasing `min_profit_usd`
 
 ## License
