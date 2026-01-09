@@ -42,7 +42,7 @@ class JupiterClient:
     
     # Authenticated endpoints (require API key) - ordered by preference
     AUTH_ENDPOINTS = [
-        "https://api.jup.ag/v6",
+        "https://api.jup.ag",
         # Add alternative authenticated endpoints here if available
     ]
     
@@ -96,12 +96,10 @@ class JupiterClient:
             - '401': Unauthorized (endpoint requires auth, don't retry)
             - 'other': Other error (don't retry)
         """
-        # Use correct endpoint path: /v6/quote
-        # If endpoint already ends with /v6, use /quote; otherwise use /v6/quote
-        if endpoint.endswith('/v6'):
-            url = f"{endpoint}/quote"
-        else:
-            url = f"{endpoint}/v6/quote"
+        # Use correct endpoint path: /swap/v1/quote (current working Jupiter API endpoint)
+        # Remove any trailing /v6 or /v1 from endpoint base URL
+        base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
+        url = f"{base_url}/swap/v1/quote"
         start_time = time.time()
         
         try:
@@ -143,6 +141,11 @@ class JupiterClient:
                     self._tried_endpoints.add(endpoint)
                     logger.warning(f"Endpoint {endpoint} requires authentication (401). No API key provided.")
                     return None, '401'
+            elif e.response.status_code == 404:
+                # 404 = route not found (no route available for this pair)
+                # This is a valid API response, not a transport error - don't mark endpoint as failed
+                logger.debug(f"Route not found for {params.get('inputMint', '')[:8]}... -> {params.get('outputMint', '')[:8]}... (404)")
+                return None, '404'
             else:
                 # Other HTTP errors - don't retry this endpoint
                 self._tried_endpoints.add(endpoint)
@@ -224,8 +227,9 @@ class JupiterClient:
                 return quote
             
             # If DNS error, continue to next endpoint
+            # If 404 (route not found), continue to next endpoint (valid API response, no route available)
             # If 401 or other error, endpoint is marked as tried and won't be retried
-            if error_type == 'dns':
+            if error_type == 'dns' or error_type == '404':
                 continue
             # For 401 and other errors, endpoint is already marked as tried in _try_get_quote_from_endpoint
         
@@ -235,7 +239,7 @@ class JupiterClient:
         else:
             logger.warning(f"All Jupiter quote endpoints exhausted. "
                           f"Tried: {len(endpoints_to_try)} endpoints. "
-                          f"Public quote API temporarily unavailable.")
+                          f"Either no routes found for requested pairs, or API temporarily unavailable.")
         
         return None
     
@@ -297,11 +301,9 @@ class JupiterClient:
             return None
         
         try:
-            # Use correct endpoint path: /v6/swap
-            if endpoint.endswith('/v6'):
-                swap_url = f"{endpoint}/swap"
-            else:
-                swap_url = f"{endpoint}/v6/swap"
+            # Use correct endpoint path: /swap/v1/swap
+            base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
+            swap_url = f"{base_url}/swap/v1/swap"
             response = await self.client.post(swap_url, json=payload)
             response.raise_for_status()
             data = response.json()
@@ -331,11 +333,9 @@ class JupiterClient:
             return None
         
         try:
-            # Use correct endpoint path: /v6/tokens
-            if endpoint.endswith('/v6'):
-                tokens_url = f"{endpoint}/tokens"
-            else:
-                tokens_url = f"{endpoint}/v6/tokens"
+            # Use correct endpoint path: /swap/v1/tokens
+            base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
+            tokens_url = f"{base_url}/swap/v1/tokens"
             response = await self.client.get(tokens_url)
             response.raise_for_status()
             return response.json()

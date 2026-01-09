@@ -104,6 +104,22 @@
 - Improved code documentation (security comments)
 - All changes are minimal and do not affect architecture
 
+### 8. Jupiter API Endpoint Update to /swap/v1/quote ✅
+
+**Problem**: The code was using deprecated `/v6/quote` endpoint which returned 404 "Route not found" errors. The working endpoint is `/swap/v1/quote`.
+
+**Fix**:
+- Updated authenticated endpoint base URL from `https://api.jup.ag/v6` to `https://api.jup.ag`
+- Changed quote endpoint path from `/v6/quote` to `/swap/v1/quote`
+- Changed swap endpoint path from `/v6/swap` to `/swap/v1/swap`
+- Changed tokens endpoint path from `/v6/tokens` to `/swap/v1/tokens`
+- Added proper 404 error handling (route not found is a valid API response, not a transport error)
+- Enhanced logging to distinguish API transport errors from empty route results
+
+**Files**:
+- `src/jupiter_client.py`: Updated all endpoint paths to use `/swap/v1/` format
+- `src/jupiter_client.py`: Enhanced error handling for 404 responses
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -113,3 +129,4 @@
 ✅ Sending without simulation impossible (mandatory check)
 ✅ All RiskConfig attributes synchronized (no AttributeError)
 ✅ Jupiter API uses working DNS endpoint (api.jup.ag)
+✅ Jupiter API uses correct endpoint format (/swap/v1/quote)
