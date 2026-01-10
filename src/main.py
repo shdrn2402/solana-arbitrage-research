@@ -189,7 +189,7 @@ async def main():
         risk_manager.update_wallet_balance(balance)
         logger.info(f"Wallet balance: {balance / 1e9:.4f} SOL")
     
-    # Get tokens from config (minimal set: SOL, USDC, USDT, JUP)
+    # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
     tokens_config = config.get('tokens', {})
     tokens = list(tokens_config.values())
     if not tokens:
@@ -197,8 +197,8 @@ async def main():
         tokens = [
             "So11111111111111111111111111111111111111112",  # SOL
             "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
             "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
         ]
     
     # Initialize arbitrage finder

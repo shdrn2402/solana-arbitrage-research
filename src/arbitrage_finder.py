@@ -35,32 +35,32 @@ class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
     # Fixed minimal cycle set for quota-safe scanning
-    # Only 6 predefined cycles with 4 tokens: SOL, USDC, USDT, JUP
+    # Only 6 predefined cycles with 4 tokens: SOL, USDC, JUP, BONK
     FIXED_CYCLES = [
         ["So11111111111111111111111111111111111111112",  # SOL
          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
          "So11111111111111111111111111111111111111112"],  # SOL
         ["So11111111111111111111111111111111111111112",  # SOL
-         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
          "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
          "So11111111111111111111111111111111111111112"],  # SOL
         ["So11111111111111111111111111111111111111112",  # SOL
-         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
          "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
          "So11111111111111111111111111111111111111112"],  # SOL
         ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
          "So11111111111111111111111111111111111111112",  # SOL
-         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
-        ["Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+        ["JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
          "So11111111111111111111111111111111111111112",  # SOL
          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"]  # USDT
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"],  # JUP
+        ["DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"]  # BONK
     ]
     
     def __init__(
