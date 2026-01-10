@@ -19,15 +19,7 @@ from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder
 from .trader import Trader
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('arbitrage_bot.log')
-    ]
-)
+# Logger will be initialized in main() after .env is loaded
 logger = logging.getLogger(__name__)
 
 
@@ -73,9 +65,33 @@ def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
 
 async def main():
     """Main function."""
-    logger.info("Starting Solana Arbitrage Bot")
+    # Load .env FIRST to read LOG_LEVEL before setting up logging
+    env_path = Path(__file__).parent.parent / '.env'
+    if env_path.exists():
+        dotenv.load_dotenv(env_path)
     
-    # Load configuration
+    # Setup logging AFTER .env is loaded
+    log_level_str = os.getenv('LOG_LEVEL', 'INFO').upper()
+    log_level = getattr(logging, log_level_str, logging.INFO)
+    
+    # Validate log level
+    if log_level_str not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
+        print(f"Warning: Invalid LOG_LEVEL '{log_level_str}', using INFO")
+        log_level = logging.INFO
+    
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler('arbitrage_bot.log')
+        ]
+    )
+    
+    logger.info("Starting Solana Arbitrage Bot")
+    logger.debug(f"Log level set to: {log_level_str}")
+    
+    # Load configuration (will reload .env, but that's fine - dotenv doesn't overwrite existing vars)
     config = load_config()
     
     # Environment variables
