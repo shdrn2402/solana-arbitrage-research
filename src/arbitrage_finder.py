@@ -1,6 +1,6 @@
 """
 Arbitrage opportunity finder.
-Searches for A -> B -> A cycles with profit.
+Searches for A -> B -> C -> A cycles (3-leg cycles) with profit.
 """
 import asyncio
 import logging
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ArbitrageOpportunity:
     """Represents an arbitrage opportunity."""
-    cycle: List[str]  # [token1, token2, token1]
+    cycle: List[str]  # [token1, token2, token3, token1] - 3-leg cycle with 4 elements
     quotes: List[JupiterQuote]
     initial_amount: int
     final_amount: int
@@ -47,7 +47,7 @@ class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
     # Fixed minimal cycle set for quota-safe scanning
-    # Only 6 predefined cycles with 4 tokens: SOL, USDC, JUP, BONK
+    # Only 6 predefined 3-leg cycles (A->B->C->A format) using 4 tokens: SOL, USDC, JUP, BONK
     FIXED_CYCLES = [
         ["So11111111111111111111111111111111111111112",  # SOL
          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
@@ -193,7 +193,7 @@ class ArbitrageFinder:
         Check if a cycle is profitable.
         
         Args:
-            cycle: List of token mints [A, B, A] or [A, B, C, A]
+            cycle: List of token mints [A, B, C, A] (3-leg cycle, 4 elements total)
             initial_amount: Starting amount in smallest unit
         
         Returns:
