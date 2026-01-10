@@ -351,6 +351,30 @@
 
 **Note**: Both security checks are critical and block transaction execution if validation fails. Quote expiry check uses slot-based validation (not timestamp). Balance is updated in risk_manager before checking available balance.
 
+### 20. Add DIAGNOSTIC_AMOUNT_SOL Configuration Variable ✅
+
+**Problem**: Diagnostic mode used hardcoded 1 SOL amount in `jupiter_client.py` method `get_sol_price_usdc()` (line 351). This prevented testing with different amounts and made the code less flexible for diagnostic purposes.
+
+**Fix**:
+- Added `DIAGNOSTIC_AMOUNT_SOL` environment variable in `env.example`
+- Added `amount_sol: float = 1.0` parameter to `get_sol_price_usdc()` method in `jupiter_client.py`
+- Convert hardcoded `amount = 1_000_000_000` to `amount = int(amount_sol * 1e9)` using parameter
+- Read `DIAGNOSTIC_AMOUNT_SOL` from `.env` in diagnostic mode (default: 1.0 SOL)
+- Pass `diagnostic_amount_sol` to `get_sol_price_usdc()` call in diagnostic mode
+- Updated logging to show actual amount used: `logger.info(f"Amount: {diagnostic_amount_sol} SOL")`
+- When called at startup (line 184), uses default `amount_sol=1.0` (no change to startup behavior)
+- This makes diagnostic mode more flexible and allows testing with different amounts
+- **Note**: Scan and simulate modes continue to use risk limit calculations (no changes to their logic)
+
+**Files**:
+- `env.example`: Added `DIAGNOSTIC_AMOUNT_SOL` variable in Diagnostic Mode section (after `DIAGNOSTIC_SLIPPAGE_BPS`, line 69)
+- `src/jupiter_client.py`: Added `amount_sol: float = 1.0` parameter to `get_sol_price_usdc()` method (line 337)
+- `src/jupiter_client.py`: Replaced hardcoded `amount = 1_000_000_000` with `amount = int(amount_sol * 1e9)` (line 353)
+- `src/main.py`: Added reading of `DIAGNOSTIC_AMOUNT_SOL` from `.env` in diagnostic mode (line 254)
+- `src/main.py`: Pass `amount_sol=diagnostic_amount_sol` to `get_sol_price_usdc()` call (line 263)
+- `src/main.py`: Updated logging to show configured amount instead of hardcoded "1.0 SOL" (line 257)
+- `CHANGES.md`: Added entry documenting the configuration variable and code implementation
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -372,3 +396,4 @@
 ✅ Logging level is configurable via `.env` (`LOG_LEVEL`): supports DEBUG, INFO, WARNING, ERROR, CRITICAL with validation and fallback to INFO
 ✅ Critical bugs fixed: simulation validation now uses actual quote values instead of comparing with itself, profit filtering explicitly checks `min_profit_bps > 0` before applying filter
 ✅ Security checks added before transaction execution: quote expiry validation (last_valid_block_height) and balance re-check prevent execution with stale quotes or insufficient balance
+✅ Diagnostic mode configuration: `DIAGNOSTIC_AMOUNT_SOL` variable added for configurable diagnostic request amount (default: 1.0 SOL)

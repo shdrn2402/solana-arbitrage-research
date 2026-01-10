@@ -251,13 +251,16 @@ async def main():
         logger.info("DIAGNOSTIC MODE: Testing Jupiter route capability")
         logger.info("=" * 60)
         
+        diagnostic_amount_sol = float(os.getenv('DIAGNOSTIC_AMOUNT_SOL', '1.0'))
+        
         logger.info(f"Request: SOL → USDC")
-        logger.info(f"Amount: 1.0 SOL")
+        logger.info(f"Amount: {diagnostic_amount_sol} SOL")
         logger.info(f"Parameters: slippageBps={diagnostic_slippage_bps}, onlyDirectRoutes=false")
         
         quote = await jupiter.get_sol_price_usdc(
             slippage_bps=diagnostic_slippage_bps,
-            return_full_quote=True
+            return_full_quote=True,
+            amount_sol=diagnostic_amount_sol
         )
         
         if quote:

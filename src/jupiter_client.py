@@ -333,7 +333,8 @@ class JupiterClient:
     async def get_sol_price_usdc(
         self,
         slippage_bps: int = 10,
-        return_full_quote: bool = False
+        return_full_quote: bool = False,
+        amount_sol: float = 1.0
     ) -> Optional[Union[float, JupiterQuote]]:
         """
         Get SOL price in USDC from Jupiter API.
@@ -341,6 +342,7 @@ class JupiterClient:
         Args:
             slippage_bps: Slippage in basis points (default: 10 for accurate price)
             return_full_quote: If True, return full JupiterQuote object; if False, return price as float
+            amount_sol: Amount in SOL to use for quote (default: 1.0 SOL)
         
         Returns:
             If return_full_quote=False: float price (USDC per SOL) or None if failed
@@ -348,7 +350,7 @@ class JupiterClient:
         """
         sol_mint = "So11111111111111111111111111111111111111112"
         usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        amount = 1_000_000_000  # 1 SOL in lamports
+        amount = int(amount_sol * 1e9)  # Convert SOL to lamports
         
         logger.debug(f"Fetching SOL price: {amount / 1e9} SOL → USDC (slippage_bps={slippage_bps})")
         
