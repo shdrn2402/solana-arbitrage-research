@@ -184,6 +184,45 @@
 - `src/main.py`: Added final validation summary logging with adjusted/current values
 - `env.example`: Improved comments for `MAX_SLIPPAGE_BPS` and `SLIPPAGE_BPS` to clarify their relationship
 
+### 12. Refactoring SOL/USDC Price Fetching Method ✅
+
+**Problem**: Code for fetching SOL price from Jupiter API was duplicated in diagnostic mode and was needed for startup initialization. The logic was scattered and not reusable.
+
+**Fix**:
+- Added centralized method `get_sol_price_usdc()` in `JupiterClient` class
+- Method supports two modes: return price as `float` or return full `JupiterQuote` object
+- Default slippage set to 10 bps for accurate price fetching
+- Refactored diagnostic mode to use new method with `return_full_quote=True` (preserves all existing functionality including route_plan logging)
+- Added automatic SOL price fetching at startup from Jupiter API with fallback to `.env` value
+- Price is fetched after `JupiterClient` initialization and before `RiskManager` initialization
+- If price is successfully fetched, `risk_config.sol_price_usdc` and `risk_config.max_position_size_absolute_usdc` are automatically updated
+
+**Files**:
+- `src/jupiter_client.py`: Added `async def get_sol_price_usdc(slippage_bps: int = 10, return_full_quote: bool = False)` method
+- `src/jupiter_client.py`: Added `Union` import for type hints
+- `src/main.py`: Refactored diagnostic mode (lines 229-266) to use `jupiter.get_sol_price_usdc(return_full_quote=True)`
+- `src/main.py`: Added automatic SOL price fetching at startup (lines 167-181) with fallback to `.env` value
+- `src/main.py`: Added automatic update of `risk_config.sol_price_usdc` and `risk_config.max_position_size_absolute_usdc` when price is fetched
+
+### 13. Remove Hardcoded SOL Price from ArbitrageFinder ✅
+
+**Problem**: `ArbitrageFinder` used hardcoded `sol_price_usdc = 100.0` in `_estimate_profit_usd()` method, which caused incorrect profit calculations when actual SOL price differed from the hardcoded value. The actual price from config (automatically fetched from Jupiter API) was not being used.
+
+**Fix**:
+- Added `sol_price_usdc: float = 100.0` parameter to `ArbitrageFinder.__init__()` constructor (with default for backward compatibility)
+- Store value in `self.sol_price_usdc` instance variable
+- Replaced hardcoded `sol_price_usdc = 100.0` in `_estimate_profit_usd()` method with `self.sol_price_usdc`
+- Updated method comment to remove placeholder mention, keeping note about future price oracle improvement
+- Pass `sol_price_usdc=risk_config.sol_price_usdc` when creating `ArbitrageFinder` in `main.py`
+- Value is automatically updated from Jupiter API (or `.env` fallback) before `ArbitrageFinder` creation, ensuring accurate price is always used
+
+**Files**:
+- `src/arbitrage_finder.py`: Added `sol_price_usdc: float = 100.0` parameter to `__init__()` constructor (line 76)
+- `src/arbitrage_finder.py`: Store in `self.sol_price_usdc` (line 86)
+- `src/arbitrage_finder.py`: Replaced hardcoded value in `_estimate_profit_usd()` method with `self.sol_price_usdc` (line 268)
+- `src/arbitrage_finder.py`: Updated method comment to remove placeholder mention
+- `src/main.py`: Pass `sol_price_usdc=risk_config.sol_price_usdc` parameter when creating `ArbitrageFinder` (line 215)
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -197,3 +236,5 @@
 ✅ Minimal scan configuration: 4 tokens, 6 fixed cycles, sequential processing with delays (quota-safe)
 ✅ Slippage is configurable via `.env` (`SLIPPAGE_BPS`, `DIAGNOSTIC_SLIPPAGE_BPS`) with validation against `MAX_SLIPPAGE_BPS`
 ✅ Improved slippage validation and logging: explicit warnings when `MAX_SLIPPAGE_BPS` is not set, detailed error messages with instructions, final configuration summary
+✅ Centralized SOL/USDC price fetching method: no code duplication, automatic price fetching at startup, reusable for diagnostic mode
+✅ ArbitrageFinder uses actual SOL price from config (auto-fetched from Jupiter API or `.env`): correct profit calculations regardless of SOL price, no hardcoded values

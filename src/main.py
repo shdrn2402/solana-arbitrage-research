@@ -119,9 +119,9 @@ async def main():
     
     # Slippage configuration - save original value before validation
     slippage_bps_env = os.getenv('SLIPPAGE_BPS')
-    slippage_bps_explicitly_set = 'SLIPPAGE_BPS' in os.environ
-    slippage_bps_original = int(slippage_bps_env) if slippage_bps_env else 50
-    slippage_bps = slippage_bps_original
+    slippage_bps_explicitly_set = slippage_bps_env is not None
+    slippage_bps = int(slippage_bps_env) if (slippage_bps_env and slippage_bps_env.strip()) else 50
+    slippage_bps_original = slippage_bps  # Сохраняем для сравнения после валидации
     diagnostic_slippage_bps = int(os.getenv('DIAGNOSTIC_SLIPPAGE_BPS', '500'))
     
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
@@ -164,6 +164,22 @@ async def main():
     jupiter = JupiterClient(jupiter_api_url, api_key=jupiter_api_key)
     solana = SolanaClient(rpc_url, wallet)
     
+    # Try to fetch SOL price from Jupiter API
+    sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
+    if sol_price_auto and sol_price_auto > 0:
+        sol_price_usdc = sol_price_auto
+        logger.info(f"SOL price fetched from Jupiter API: ${sol_price_usdc:.2f} USDC")
+        # Update risk_config with fetched price
+        risk_config.sol_price_usdc = sol_price_usdc
+        # Recalculate max_position_absolute_usdc with updated price
+        risk_config.max_position_size_absolute_usdc = max_position_absolute_sol * sol_price_usdc
+    else:
+        # Fallback to .env value
+        logger.warning(
+            f"Could not fetch SOL price from Jupiter API, using .env value: "
+            f"${sol_price_usdc:.2f} USDC"
+        )
+    
     # Initialize risk manager
     risk_manager = RiskManager(risk_config)
     
@@ -195,7 +211,8 @@ async def main():
         max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
         max_cycles=arbitrage_config.get('max_cycles', 100),
         quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
-        slippage_bps=slippage_bps
+        slippage_bps=slippage_bps,
+        sol_price_usdc=risk_config.sol_price_usdc
     )
     
     # Initialize trader with mode for safety checks
@@ -218,20 +235,13 @@ async def main():
         logger.info("DIAGNOSTIC MODE: Testing Jupiter route capability")
         logger.info("=" * 60)
         
-        sol_mint = "So11111111111111111111111111111111111111112"
-        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        test_amount = 1_000_000_000  # 1 SOL
-        
         logger.info(f"Request: SOL → USDC")
-        logger.info(f"Amount: {test_amount / 1e9:.2f} SOL")
+        logger.info(f"Amount: 1.0 SOL")
         logger.info(f"Parameters: slippageBps={diagnostic_slippage_bps}, onlyDirectRoutes=false")
         
-        quote = await jupiter.get_quote(
-            input_mint=sol_mint,
-            output_mint=usdc_mint,
-            amount=test_amount,
+        quote = await jupiter.get_sol_price_usdc(
             slippage_bps=diagnostic_slippage_bps,
-            only_direct_routes=False
+            return_full_quote=True
         )
         
         if quote:

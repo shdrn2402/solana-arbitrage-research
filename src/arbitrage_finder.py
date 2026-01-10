@@ -72,7 +72,8 @@ class ArbitrageFinder:
         max_cycle_length: int = 4,
         max_cycles: int = 100,
         quote_timeout: float = 5.0,
-        slippage_bps: int = 50
+        slippage_bps: int = 50,
+        sol_price_usdc: float = 100.0
     ):
         self.jupiter = jupiter_client
         self.tokens = tokens
@@ -82,6 +83,7 @@ class ArbitrageFinder:
         self.max_cycles = max_cycles
         self.quote_timeout = quote_timeout
         self.slippage_bps = slippage_bps
+        self.sol_price_usdc = sol_price_usdc
     
     async def find_opportunities(
         self,
@@ -260,8 +262,7 @@ class ArbitrageFinder:
         
         Returns profit in USDC.
         """
-        # Simplified: assumes SOL price for conversion
-        # In production, should use price oracle based on token_mint
-        sol_price_usdc = 100.0  # placeholder - should come from config/oracle
+        # Simplified: uses SOL price from config for conversion
+        # In production, should use price oracle based on token_mint for more accurate calculation
         profit_sol = (amount_out - amount_in) / 1e9
-        return profit_sol * sol_price_usdc
+        return profit_sol * self.sol_price_usdc

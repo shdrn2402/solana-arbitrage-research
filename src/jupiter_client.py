@@ -3,7 +3,7 @@ Jupiter API Client for quotes and swap transactions.
 """
 import httpx
 import time
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, Union
 from dataclasses import dataclass
 import logging
 
@@ -324,6 +324,49 @@ class JupiterClient:
             return None
         except Exception as e:
             logger.error(f"Error building swap transaction: {e}")
+            return None
+    
+    async def get_sol_price_usdc(
+        self,
+        slippage_bps: int = 10,
+        return_full_quote: bool = False
+    ) -> Optional[Union[float, JupiterQuote]]:
+        """
+        Get SOL price in USDC from Jupiter API.
+        
+        Args:
+            slippage_bps: Slippage in basis points (default: 10 for accurate price)
+            return_full_quote: If True, return full JupiterQuote object; if False, return price as float
+        
+        Returns:
+            If return_full_quote=False: float price (USDC per SOL) or None if failed
+            If return_full_quote=True: JupiterQuote object or None if failed
+        """
+        sol_mint = "So11111111111111111111111111111111111111112"
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        amount = 1_000_000_000  # 1 SOL in lamports
+        
+        logger.debug(f"Fetching SOL price: {amount / 1e9} SOL → USDC (slippage_bps={slippage_bps})")
+        
+        quote = await self.get_quote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            amount=amount,
+            slippage_bps=slippage_bps,
+            only_direct_routes=False
+        )
+        
+        if quote:
+            if return_full_quote:
+                logger.debug(f"SOL price quote received: {quote.out_amount / 1e6:.2f} USDC")
+                return quote
+            else:
+                # Return price as float (USDC per SOL, USDC has 6 decimals)
+                price = quote.out_amount / 1e6
+                logger.debug(f"SOL price from Jupiter API: ${price:.2f} USDC")
+                return price
+        else:
+            logger.debug("Failed to get SOL price from Jupiter API")
             return None
     
     async def get_tokens(self) -> Optional[List[Dict[str, Any]]]:
