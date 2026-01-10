@@ -125,19 +125,19 @@
 **Problem**: High Jupiter API quota consumption due to large token universe and combinatorial cycle generation.
 
 **Fix**:
-- Limited token universe to exactly 4 tokens: SOL, USDC, USDT, JUP
+- Limited token universe to exactly 4 tokens: SOL, USDC, JUP, BONK (updated in change #16: USDT replaced with BONK)
 - Replaced dynamic cycle generation with fixed list of 6 predefined cycles
 - Removed parallelism: cycles checked sequentially (one at a time)
 - Added 200ms delays between quote requests to avoid quota spikes
 - Single pass per scan run (no iterations/repeats)
 
 **Files**:
-- `config.json`: Reduced tokens to 4 (SOL, USDC, USDT, JUP)
+- `config.json`: Reduced tokens to 4 (SOL, USDC, JUP, BONK - see change #16 for BONK addition)
 - `src/arbitrage_finder.py`: Added `FIXED_CYCLES` constant with 6 predefined cycles
 - `src/arbitrage_finder.py`: Replaced parallel batch processing with sequential checking
 - `src/arbitrage_finder.py`: Added delays between cycles and within cycle legs
 - `src/main.py`: Added quota-safe scan info log message
-- `src/main.py`: Updated default tokens to include JUP
+- `src/main.py`: Updated default tokens to include JUP (and later BONK in change #16)
 
 ### 10. Configurable Slippage via Environment Variables ✅
 
@@ -255,6 +255,50 @@
 
 **Note**: Logic remains the same: if variable is set in `.env` (even as empty string), `os.getenv()` returns string and `is not None` returns `True`. If variable is not set, `os.getenv()` returns `None` and `is not None` returns `False`.
 
+### 16. Replace USDT with BONK in Arbitrage Cycles ✅
+
+**Problem**: Cycles included USDT (USDC ↔ USDT is not useful for arbitrage as both are stablecoins). The bot needed more volatile token pairs for better arbitrage opportunities.
+
+**Fix**:
+- Removed all cycles containing USDT from `FIXED_CYCLES`
+- Added BONK (volatile meme coin) to all cycles for more interesting arbitrage opportunities
+- Updated token set from SOL, USDC, USDT, JUP to SOL, USDC, JUP, BONK
+- Created 6 new cycles with volatile pairs:
+  1. SOL → USDC → BONK → SOL
+  2. SOL → JUP → BONK → SOL
+  3. SOL → USDC → JUP → SOL
+  4. USDC → SOL → BONK → USDC
+  5. JUP → SOL → USDC → JUP
+  6. BONK → SOL → USDC → BONK
+- All cycles remain closed (start and end with the same token)
+
+**Files**:
+- `src/arbitrage_finder.py`: Replaced `FIXED_CYCLES` with new cycles without USDT, added BONK (lines 37-64)
+- `src/arbitrage_finder.py`: Updated comment to reflect new token set (line 38)
+- `config.json`: Removed USDT, added BONK with address "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+- `src/main.py`: Updated default tokens list and comment (lines 192-202)
+- `README.md`: Updated config.json example to remove USDT and add BONK
+
+### 17. Implement LOG_LEVEL Configuration from .env ✅
+
+**Problem**: `LOG_LEVEL` variable from `.env` was ignored. Logging was hardcoded to `INFO` level, making it impossible to configure logging level via environment variables.
+
+**Fix**:
+- Removed hardcoded `logging.basicConfig()` from module level (it was called before `.env` was loaded)
+- Moved logging setup inside `main()` function after `.env` is loaded
+- Added reading of `LOG_LEVEL` from `.env` with default `INFO`
+- Supports standard log levels: DEBUG, INFO, WARNING, ERROR, CRITICAL
+- Added validation: invalid levels fallback to INFO with warning message
+- Logging configuration now happens after `dotenv.load_dotenv()` is called
+
+**Files**:
+- `src/main.py`: Removed hardcoded `logging.basicConfig()` from module level (lines 22-30)
+- `src/main.py`: Added `.env` loading and logging setup at start of `main()` function (lines 68-92)
+- `src/main.py`: Added log level validation and conversion from string to `logging.LEVEL`
+- `src/main.py`: Added debug logging of configured log level
+
+**Note**: `logging.basicConfig()` is now called only once inside `main()` after `.env` is loaded. All other modules inherit the configured log level automatically.
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -272,3 +316,5 @@
 ✅ ArbitrageFinder uses actual SOL price from config (auto-fetched from Jupiter API or `.env`): correct profit calculations regardless of SOL price, no hardcoded values
 ✅ Consistent naming convention: all profit minimum values use `usdc` suffix consistently across `.env`, `config.json`, and code
 ✅ Code optimization: removed redundant double environment access for `MAX_SLIPPAGE_BPS`, consistent with `SLIPPAGE_BPS` implementation
+✅ Arbitrage cycles updated: removed USDT (stablecoin pairs not useful for arbitrage), added BONK (volatile meme coin) for better arbitrage opportunities
+✅ Logging level is configurable via `.env` (`LOG_LEVEL`): supports DEBUG, INFO, WARNING, ERROR, CRITICAL with validation and fallback to INFO
