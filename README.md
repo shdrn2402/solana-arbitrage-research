@@ -4,17 +4,26 @@ Off-chain arbitrage research bot for Solana using the Jupiter Aggregator API for
 
 ## Project Status
 
-This project is an experimental / research prototype.
+This project is an experimental / research prototype developed iteratively.
 
-- Scan mode: experimental
-- Simulate mode: experimental
-- Live trading: disabled by default
+### ✅ Stage 1 — Scan (completed)
+- **Stable Jupiter API integration** — reliable quote retrieval via public API
+- **Arbitrage path discovery** — deterministic cycle generation and evaluation
+- **Configurable token universe** — adjustable tokens and cycle depth
+- **Quota-optimized scanning** — rate-limited execution (60 requests/minute) with configurable delays
+- **12 predefined cycles** — doubled coverage while respecting API quotas (~40-45 seconds per scan)
+- **Read-only mode** — no on-chain execution or fund usage
 
-Due to limitations of public aggregator APIs, automated arbitrage
-execution is not guaranteed.
+### 🛠️ Stage 2 — Simulation (in progress)
+- **On-chain transaction simulation** before execution
+- **Full cycle validation** using simulated swaps
+- **Priority fee & latency experiments**
+- **Execution feasibility analysis**
 
-This repository focuses on architecture, diagnostics, and research.
-
+### 🧪 Stage 3 — Live Execution (planned / experimental)
+- **Real transaction submission**
+- **Optional Jito integration**
+- **Research-only, not production-ready**
 
 ## Features
 
@@ -58,25 +67,42 @@ cp env.example .env
 
 ### .env file
 
-Main parameters:
+Main parameters (see `env.example` for complete list):
 
 ```env
 # Solana RPC
 RPC_URL=https://api.mainnet-beta.solana.com
 
-# Wallet private key (base58)
+# Operation Mode
+MODE=scan  # scan, simulate, or live
+
+# Wallet private key (base58, required for simulate/live modes)
 WALLET_PRIVATE_KEY=your_private_key_here
 
-# Risk Management
-MAX_POSITION_SIZE_PERCENT=10.0      # Maximum position size (% of balance)
-MAX_POSITION_SIZE_ABSOLUTE=1.0      # Maximum position size (SOL)
-MIN_PROFIT_BPS=50                   # Minimum profit (basis points)
-MAX_SLIPPAGE_BPS=50                 # Maximum slippage (basis points)
-MAX_ACTIVE_POSITIONS=1              # Maximum active positions
+# Risk Management (all absolute limits in USDC)
+MAX_POSITION_SIZE_PERCENT=10.0
+MAX_POSITION_SIZE_ABSOLUTE=1.0  # in SOL
+MIN_PROFIT_USDC=0.1  # PRIMARY: minimum profit in USDC
+MIN_PROFIT_BPS=50  # SECONDARY: optional filter (set to 0 to disable)
+MAX_SLIPPAGE_BPS=50  # Maximum allowed slippage (risk limit)
+SLIPPAGE_BPS=50  # Actual slippage used in Jupiter API requests
+MAX_ACTIVE_POSITIONS=1
+
+# Arbitrage Configuration
+QUOTE_DELAY_SECONDS=1.0  # Delay between requests (for 60 req/min limit)
 
 # Priority Fee
 PRIORITY_FEE_LAMPORTS=10000
 USE_JITO=false
+
+# Logging
+LOG_LEVEL=INFO
+```
+
+Or use `env.example` as template:
+```bash
+cp env.example .env
+# Edit .env with your values
 ```
 
 ### config.json
@@ -93,7 +119,7 @@ Additional settings:
   },
   "arbitrage": {
     "min_profit_usdc": 0.1,
-    "max_cycle_length": 3,
+    "max_cycle_length": 4,
     "quote_timeout": 5.0
   }
 }
@@ -109,7 +135,13 @@ Read-only mode for analyzing potential arbitrage paths without executing transac
 python run.py scan
 ```
 
-Output (if available):
+**Configuration:**
+- 12 predefined 3-leg cycles (A → B → C → A format)
+- 4 tokens: SOL, USDC, JUP, BONK
+- Rate-limited to 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
+- Execution time: ~40-45 seconds per scan
+
+**Output** (if available):
 - List of found opportunities
 - Profit in bps and USD
 - Exchange cycles
@@ -165,8 +197,8 @@ The bot includes a comprehensive risk management system:
    - Absolute ceiling (`MAX_POSITION_SIZE_ABSOLUTE`)
 
 2. **Minimum profit**
-   - In basis points (`MIN_PROFIT_BPS`)
-   - In USDC (`min_profit_usdc` in config.json)
+   - PRIMARY: In USDC (`MIN_PROFIT_USDC`) - always enforced
+   - SECONDARY: In basis points (`MIN_PROFIT_BPS`) - optional filter (set to 0 to disable)
 
 3. **Slippage control**
    - Maximum slippage (`MAX_SLIPPAGE_BPS`)
@@ -201,11 +233,13 @@ src/
 ## How It Works
 
 1. **Opportunity search** (`arbitrage_finder.py`)
-   - Evaluates predefined exchange cycles (e.g. A → B → A, A → B → C → A)
+   - Evaluates 12 predefined 3-leg exchange cycles (A → B → C → A format)
+   - Uses 4 tokens: SOL, USDC, JUP, BONK
+   - Rate-limited to 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
    - Gets quotes via Jupiter Quote API
    - Calculates profit accounting for fees and slippage
-   - The project intentionally uses a limited, predefined set of cycles
-     to simplify diagnostics and architectural research.
+   - The project uses 12 predefined 3-leg cycles for quota-optimized scanning
+   - Execution time: ~40-45 seconds per scan (rate-limited at 60 req/min)
 
 2. **Risk check** (`risk_manager.py`)
    - Checks all limits
@@ -232,8 +266,9 @@ src/
 
 ### Limitations
 
-- Bot searches for simple cycles (2-3 leg)
-- Jupiter API has rate limits
+- Bot searches for 3-leg cycles (A → B → C → A format) using 4 tokens: SOL, USDC, JUP, BONK
+- Jupiter API rate limit: 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
+- Scan execution time: ~40-45 seconds (12 cycles, 36 requests total)
 - RPC latency affects arbitrage success
 - MEV bots may outpace your transactions
 

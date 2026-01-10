@@ -139,6 +139,7 @@ async def main():
     slippage_bps = int(slippage_bps_env) if (slippage_bps_env and slippage_bps_env.strip()) else 50
     slippage_bps_original = slippage_bps  # Сохраняем для сравнения после валидации
     diagnostic_slippage_bps = int(os.getenv('DIAGNOSTIC_SLIPPAGE_BPS', '500'))
+    quote_delay_seconds = float(os.getenv('QUOTE_DELAY_SECONDS', '1.0'))
     
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
     # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
@@ -228,7 +229,8 @@ async def main():
         max_cycles=arbitrage_config.get('max_cycles', 100),
         quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
         slippage_bps=slippage_bps,
-        sol_price_usdc=risk_config.sol_price_usdc
+        sol_price_usdc=risk_config.sol_price_usdc,
+        quote_delay_seconds=quote_delay_seconds
     )
     
     # Initialize trader with mode for safety checks
@@ -323,7 +325,7 @@ async def main():
     try:
         if mode == 'scan':
             logger.info("Mode: SCAN (read-only)")
-            logger.info("Minimal scan: tokens=4 cycles=6 (quota-safe)")
+            logger.info(f"Optimized scan: tokens=4 cycles=12 delay={quote_delay_seconds}s (rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,

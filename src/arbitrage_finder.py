@@ -46,8 +46,9 @@ class ArbitrageOpportunity:
 class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
-    # Fixed minimal cycle set for quota-safe scanning
-    # Only 6 predefined 3-leg cycles (A->B->C->A format) using 4 tokens: SOL, USDC, JUP, BONK
+    # Fixed cycle set for quota-optimized scanning (rate limit: 60 req/min)
+    # 12 predefined 3-leg cycles (A->B->C->A format) using 4 tokens: SOL, USDC, JUP, BONK
+    # With 1.0 sec delay between requests: 12 cycles × 3 requests = 36 requests in ~40-45 seconds
     FIXED_CYCLES = [
         ["So11111111111111111111111111111111111111112",  # SOL
          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
@@ -72,7 +73,31 @@ class ArbitrageFinder:
         ["DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
          "So11111111111111111111111111111111111111112",  # SOL
          "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"]  # BONK
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"],  # BONK
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["So11111111111111111111111111111111111111112",  # SOL
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112"],  # SOL
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
+        ["JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "So11111111111111111111111111111111111111112",  # SOL
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"]  # JUP
     ]
     
     def __init__(
@@ -85,7 +110,8 @@ class ArbitrageFinder:
         max_cycles: int = 100,
         quote_timeout: float = 5.0,
         slippage_bps: int = 50,
-        sol_price_usdc: float = 100.0
+        sol_price_usdc: float = 100.0,
+        quote_delay_seconds: float = 1.0
     ):
         self.jupiter = jupiter_client
         self.tokens = tokens
@@ -96,6 +122,7 @@ class ArbitrageFinder:
         self.quote_timeout = quote_timeout
         self.slippage_bps = slippage_bps
         self.sol_price_usdc = sol_price_usdc
+        self.quote_delay_seconds = quote_delay_seconds
     
     async def find_opportunities(
         self,
@@ -116,7 +143,7 @@ class ArbitrageFinder:
         """
         opportunities = []
         
-        # Use fixed minimal cycle set (quota-safe: only 6 cycles)
+        # Use fixed cycle set (quota-optimized: 12 cycles with configurable delays)
         cycles = self.FIXED_CYCLES
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
@@ -128,8 +155,8 @@ class ArbitrageFinder:
             if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
                 opportunities.append(result)
             
-            # Delay between cycles to avoid quota spikes (150-250ms)
-            await asyncio.sleep(0.2)
+            # Delay between cycles for rate limiting (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
+            await asyncio.sleep(self.quote_delay_seconds)
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.profit_bps, reverse=True)
@@ -222,9 +249,9 @@ class ArbitrageFinder:
                 quotes.append(quote)
                 current_amount = quote.out_amount
                 
-                # Delay between quote requests within a cycle (150-250ms)
+                # Delay between quote requests within a cycle (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
                 if i < len(cycle) - 2:  # Don't delay after last leg
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(self.quote_delay_seconds)
             
             # Calculate profit
             final_amount = current_amount
