@@ -310,13 +310,17 @@ class JupiterClient:
             response.raise_for_status()
             data = response.json()
             
+            last_valid_block_height = data.get("lastValidBlockHeight", 0)
+            if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
+                logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
+            
             swap_response = JupiterSwapResponse(
                 swap_transaction=data.get("swapTransaction", ""),
-                last_valid_block_height=data.get("lastValidBlockHeight", 0),
+                last_valid_block_height=last_valid_block_height,
                 priority_fee_lamports=priority_fee_lamports
             )
             
-            logger.debug(f"Swap transaction built: {len(swap_response.swap_transaction)} bytes")
+            logger.debug(f"Swap transaction built: {len(swap_response.swap_transaction)} bytes, last_valid_block_height: {swap_response.last_valid_block_height}")
             return swap_response
             
         except httpx.HTTPStatusError as e:

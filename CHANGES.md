@@ -299,6 +299,58 @@
 
 **Note**: `logging.basicConfig()` is now called only once inside `main()` after `.env` is loaded. All other modules inherit the configured log level automatically.
 
+### 18. Fix Critical Bugs in Simulation Validation and Profit Filtering ✅
+
+**Problem**: Two critical bugs were found:
+1. Simulation validation compared `opportunity.final_amount` with itself instead of actual simulation result
+2. Profit filtering in `ArbitrageFinder.is_valid()` did not explicitly check if `min_profit_bps > 0` before applying the filter, making it unclear when the filter is disabled
+
+**Fix**:
+- **Simulation validation**: Changed to use `first_quote.out_amount` from `opportunity.quotes[0]` as expected value (simulation only executes first leg of cycle)
+- Added comments explaining that simulation validates only the first leg, not the full cycle
+- Added TODO comment for future extraction of actual output from sim_result logs/accounts
+- **Profit filtering**: Added explicit check `if min_profit_bps > 0` before applying bps filter (consistent with `RiskManager.can_open_position`)
+- Changed `is_valid()` method to have clear PRIMARY (USDC, always applied) and SECONDARY (BPS, optional if > 0) checks
+- If `min_profit_bps = 0`, the bps filter is disabled (not applied)
+
+**Files**:
+- `src/trader.py`: Fixed simulation validation to use `first_quote.out_amount` instead of comparing `opportunity.final_amount` with itself (lines 171-187)
+- `src/trader.py`: Added comments about first leg validation and TODO for future improvement
+- `src/arbitrage_finder.py`: Fixed `is_valid()` method to explicitly check `min_profit_bps > 0` before applying filter (lines 28-43)
+- `src/arbitrage_finder.py`: Added clear PRIMARY/SECONDARY check structure with comments
+
+**Note**: Simulation validation now correctly validates the first leg output. Profit filtering now matches the logic in `RiskManager` where bps filter can be disabled by setting `min_profit_bps = 0`.
+
+### 19. Add Security Checks Before Transaction Execution ✅
+
+**Problem**: No validation of quote expiry (`last_valid_block_height`) or re-check of balance before sending transactions. Quotes could expire between receipt and execution, and balance could change after initial check.
+
+**Fix**:
+- **Added `get_current_slot()` method** in `SolanaClient` to get current slot/block height from Solana RPC
+- **Quote expiry check**: Added validation of `last_valid_block_height` before sending transaction
+  - Gets current slot via `get_current_slot()`
+  - Compares current slot with `last_valid_block_height` from swap response
+  - If `current_slot >= last_valid_block_height`, quote is expired and transaction is blocked
+  - If `get_current_slot()` returns `None`, warning is logged but execution continues (non-blocking)
+  - If `last_valid_block_height = 0`, expiry check is skipped with warning
+- **Balance re-check**: Added second balance check immediately before sending transaction
+  - Gets current balance via `get_balance()`
+  - Updates balance in `risk_manager` via `update_wallet_balance()`
+  - Checks `available_balance >= opportunity.initial_amount`
+  - If insufficient, transaction is blocked with error message
+- **Improved logging** in `get_swap_transaction()`: logs warning if `lastValidBlockHeight` is missing from Jupiter API response
+
+**Files**:
+- `src/solana_client.py`: Added `async def get_current_slot() -> Optional[int]` method (lines 49-68)
+- `src/solana_client.py`: Added error handling and logging for slot retrieval
+- `src/trader.py`: Added quote expiry check after building swap_response (lines 202-215)
+- `src/trader.py`: Added balance re-check before sending transaction (lines 217-227)
+- `src/trader.py`: Both checks are placed before `send_transaction()` call and block execution if failed
+- `src/jupiter_client.py`: Added logging when `lastValidBlockHeight` is missing from API response (lines 314-315)
+- `src/jupiter_client.py`: Added debug logging of `last_valid_block_height` in swap response (line 323)
+
+**Note**: Both security checks are critical and block transaction execution if validation fails. Quote expiry check uses slot-based validation (not timestamp). Balance is updated in risk_manager before checking available balance.
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -318,3 +370,5 @@
 ✅ Code optimization: removed redundant double environment access for `MAX_SLIPPAGE_BPS`, consistent with `SLIPPAGE_BPS` implementation
 ✅ Arbitrage cycles updated: removed USDT (stablecoin pairs not useful for arbitrage), added BONK (volatile meme coin) for better arbitrage opportunities
 ✅ Logging level is configurable via `.env` (`LOG_LEVEL`): supports DEBUG, INFO, WARNING, ERROR, CRITICAL with validation and fallback to INFO
+✅ Critical bugs fixed: simulation validation now uses actual quote values instead of comparing with itself, profit filtering explicitly checks `min_profit_bps > 0` before applying filter
+✅ Security checks added before transaction execution: quote expiry validation (last_valid_block_height) and balance re-check prevent execution with stale quotes or insufficient balance

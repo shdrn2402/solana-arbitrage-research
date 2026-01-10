@@ -46,6 +46,27 @@ class SolanaClient:
             logger.error(f"Error getting balance: {e}")
             return 0
     
+    async def get_current_slot(self) -> Optional[int]:
+        """
+        Get current slot/block height from Solana RPC.
+        
+        This is used to check if a quote's last_valid_block_height is still valid.
+        
+        Returns:
+            Current slot number (int) if successful, None if error occurred
+        """
+        try:
+            result = await self.client.get_slot(commitment=Confirmed)
+            if result.value is not None:
+                logger.debug(f"Current slot: {result.value}")
+                return result.value
+            else:
+                logger.warning("get_slot returned None")
+                return None
+        except Exception as e:
+            logger.error(f"Error getting current slot: {e}")
+            return None
+    
     async def simulate_transaction(
         self,
         transaction_base64: str,

@@ -197,6 +197,35 @@ class Trader:
             if swap_response is None:
                 return False, "Failed to build swap transaction", None
             
+            # Security checks before sending transaction
+            
+            # Check 1: Validate quote expiry (last_valid_block_height)
+            current_slot = await self.solana.get_current_slot()
+            if current_slot is None:
+                logger.warning("Failed to get current slot for quote expiry check, proceeding anyway")
+            else:
+                if swap_response.last_valid_block_height > 0:
+                    if current_slot >= swap_response.last_valid_block_height:
+                        error_msg = f"Quote expired: current slot {current_slot} >= last valid block height {swap_response.last_valid_block_height}"
+                        logger.warning(error_msg)
+                        return False, error_msg, None
+                    else:
+                        logger.debug(f"Quote valid: current slot {current_slot} < last valid block height {swap_response.last_valid_block_height}")
+                else:
+                    logger.warning("Quote has no last_valid_block_height set (using 0), skipping expiry check")
+            
+            # Check 2: Re-check balance before sending transaction
+            balance = await self.solana.get_balance()
+            self.risk.update_wallet_balance(balance)
+            available_balance = self.risk.get_available_balance()
+            
+            if available_balance < opportunity.initial_amount:
+                error_msg = f"Insufficient balance: need {opportunity.initial_amount / 1e9:.4f} SOL, have {available_balance / 1e9:.4f} SOL available"
+                logger.warning(error_msg)
+                return False, error_msg, None
+            else:
+                logger.debug(f"Balance check passed: have {available_balance / 1e9:.4f} SOL available, need {opportunity.initial_amount / 1e9:.4f} SOL")
+            
             # Send transaction (only in 'live' mode, already checked above)
             self.risk.update_position_status(position_id, 'executing')
             tx_sig = await self.solana.send_transaction(swap_response.swap_transaction)
