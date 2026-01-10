@@ -240,6 +240,21 @@
 
 **Note**: After this change, old configs with `min_profit_usd` will use the default value (0.1) instead of reading from config. This is acceptable as `.env` takes precedence, and the change improves naming consistency.
 
+### 15. Code Optimization: Remove Double Environment Access for MAX_SLIPPAGE_BPS ✅
+
+**Problem**: Code for reading `MAX_SLIPPAGE_BPS` had redundant double access to environment variable: `os.getenv('MAX_SLIPPAGE_BPS')` followed by `'MAX_SLIPPAGE_BPS' in os.environ`. This was inconsistent with `SLIPPAGE_BPS` implementation which uses simplified approach.
+
+**Fix**:
+- Simplified `max_slippage_bps_explicitly_set` check to use result from `os.getenv()` instead of second access to `os.environ`
+- Changed from `'MAX_SLIPPAGE_BPS' in os.environ` to `max_slippage_bps_env is not None`
+- Consistent with `SLIPPAGE_BPS` implementation (line 122)
+- Removed redundant environment variable access
+
+**Files**:
+- `src/main.py`: Changed line 103 to use `max_slippage_bps_env is not None` instead of `'MAX_SLIPPAGE_BPS' in os.environ`
+
+**Note**: Logic remains the same: if variable is set in `.env` (even as empty string), `os.getenv()` returns string and `is not None` returns `True`. If variable is not set, `os.getenv()` returns `None` and `is not None` returns `False`.
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -256,3 +271,4 @@
 ✅ Centralized SOL/USDC price fetching method: no code duplication, automatic price fetching at startup, reusable for diagnostic mode
 ✅ ArbitrageFinder uses actual SOL price from config (auto-fetched from Jupiter API or `.env`): correct profit calculations regardless of SOL price, no hardcoded values
 ✅ Consistent naming convention: all profit minimum values use `usdc` suffix consistently across `.env`, `config.json`, and code
+✅ Code optimization: removed redundant double environment access for `MAX_SLIPPAGE_BPS`, consistent with `SLIPPAGE_BPS` implementation

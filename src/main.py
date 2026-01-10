@@ -100,7 +100,7 @@ async def main():
     
     # Read MAX_SLIPPAGE_BPS with check for explicit setting
     max_slippage_bps_env = os.getenv('MAX_SLIPPAGE_BPS')
-    max_slippage_bps_explicitly_set = 'MAX_SLIPPAGE_BPS' in os.environ
+    max_slippage_bps_explicitly_set = max_slippage_bps_env is not None
     max_slippage_bps_value = int(max_slippage_bps_env) if max_slippage_bps_env else 50
     
     risk_config = RiskConfig(
