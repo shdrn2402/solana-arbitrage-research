@@ -26,9 +26,21 @@ class ArbitrageOpportunity:
     timestamp: float
     
     def is_valid(self, min_profit_bps: int, min_profit_usd: float) -> bool:
-        """Check if opportunity meets minimum requirements."""
-        return (self.profit_bps >= min_profit_bps and 
-                self.profit_usd >= min_profit_usd)
+        """
+        Check if opportunity meets minimum requirements.
+        
+        PRIMARY: profit_usd >= min_profit_usd (always applied)
+        SECONDARY: profit_bps >= min_profit_bps (optional, disabled if min_profit_bps = 0)
+        """
+        # PRIMARY check: minimum profit in USDC (always applied)
+        if self.profit_usd < min_profit_usd:
+            return False
+        
+        # SECONDARY check: optional bps filter (can be disabled by setting min_profit_bps to 0)
+        if min_profit_bps > 0 and self.profit_bps < min_profit_bps:
+            return False
+        
+        return True
 
 
 class ArbitrageFinder:

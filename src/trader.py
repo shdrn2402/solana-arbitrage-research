@@ -169,11 +169,17 @@ class Trader:
                 return False, f"Simulation failed (MANDATORY): {sim_error}", None
             
             # Validate simulation result
-            # Note: This is simplified - in production would need to extract
-            # actual output amount from simulation logs/accounts
+            # Note: Simulation only executes the first leg of the cycle (see simulate_opportunity method)
+            # Therefore, we validate only the first leg output, not the full cycle
+            first_quote = opportunity.quotes[0]
+            expected_first_leg_output = first_quote.out_amount
+            # TODO: Extract actual output from sim_result logs or accounts for full validation
+            # For now, using expected value as proxy (simplified validation of first leg only)
+            actual_first_leg_output = first_quote.out_amount  # placeholder - should extract from sim_result
+            
             is_valid, reason = self.risk.validate_simulation_result(
-                opportunity.final_amount,
-                opportunity.final_amount,  # placeholder - should extract from sim
+                expected_first_leg_output,
+                actual_first_leg_output,
                 max_deviation_bps=100
             )
             
@@ -181,7 +187,6 @@ class Trader:
                 return False, f"Simulation validation failed: {reason}", None
             
             # Build transaction
-            first_quote = opportunity.quotes[0]
             swap_response = await self.jupiter.get_swap_transaction(
                 first_quote,
                 user_pubkey,
