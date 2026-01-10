@@ -375,6 +375,76 @@
 - `src/main.py`: Updated logging to show configured amount instead of hardcoded "1.0 SOL" (line 257)
 - `CHANGES.md`: Added entry documenting the configuration variable and code implementation
 
+### 21. Optimize Jupiter API Rate Limiting: Increase Cycles and Configurable Delays ✅
+
+**Problem**: Current configuration (6 cycles × 3 requests = 18 requests in ~6 seconds ≈ 3 req/sec) exceeded Jupiter API rate limit of 60 requests/minute (1 req/sec). This limited arbitrage opportunity coverage and risked API quota violations.
+
+**Fix**:
+- Increased cycle count from 6 to 12 predefined 3-leg cycles (doubled coverage)
+- Added configurable `QUOTE_DELAY_SECONDS` environment variable (default: 1.0 sec for 60 req/min limit)
+- Optimized delays from 0.2 sec to 1.0 sec between requests (respects 1 req/sec limit)
+- Updated `ArbitrageFinder` to use configurable delay from `.env` instead of hardcoded 0.2 sec
+- Result: 12 cycles × 3 requests = 36 requests in ~40-45 seconds (0.8-0.9 req/sec, safely within limit)
+
+**Files**:
+- `env.example`: Added `QUOTE_DELAY_SECONDS=1.0` variable in new "Arbitrage Configuration" section (after line 55)
+- `src/arbitrage_finder.py`: Added 6 new cycles to `FIXED_CYCLES` (total: 12 cycles, lines 51-95)
+- `src/arbitrage_finder.py`: Added `quote_delay_seconds` parameter to `__init__()` (line ~89)
+- `src/arbitrage_finder.py`: Replaced hardcoded `0.2` sec delays with `self.quote_delay_seconds` (lines 132, 227)
+- `src/arbitrage_finder.py`: Updated comments for `FIXED_CYCLES` and delays (lines 49-50, 131, 225)
+- `src/main.py`: Added reading of `QUOTE_DELAY_SECONDS` from `.env` (after line ~141)
+- `src/main.py`: Pass `quote_delay_seconds` parameter to `ArbitrageFinder` constructor (line ~232)
+- `src/main.py`: Updated scan mode logging to show optimized configuration (line ~323)
+- `CHANGES.md`: Added entry documenting rate limit optimization
+
+### 22. Update README.md to Reflect Optimized Rate Limiting Configuration ✅
+
+**Problem**: README.md was outdated and did not reflect the current state of the project after Jupiter API rate limiting optimization. It still mentioned old configuration (6 cycles, 2-3 leg cycles, missing QUOTE_DELAY_SECONDS) and outdated performance metrics.
+
+**Fix**:
+- Updated "Quota-safe scanning" to "Quota-optimized scanning" with detailed information (12 cycles, ~40-45 seconds per scan)
+- Fixed `max_cycle_length` in config.json example (3 → 4, correct for 3-leg cycles)
+- Enhanced "Scan Mode" section with configuration details (12 cycles, 4 tokens, rate limiting, execution time)
+- Updated `.env` file example with complete parameter list including `QUOTE_DELAY_SECONDS`, `MIN_PROFIT_USDC` (PRIMARY), `MIN_PROFIT_BPS` (SECONDARY), `LOG_LEVEL`
+- Updated "Risk & Capital Management" section to clarify PRIMARY/SECONDARY logic for minimum profit
+- Updated "How It Works" → "Opportunity search" to reflect 12 predefined 3-leg cycles, 4 tokens, rate limiting, and execution time
+- Updated "Limitations" section with accurate information about 3-leg cycles, rate limits, and scan execution time
+- All sections now consistently reflect: 12 cycles, 3-leg format (A → B → C → A), 4 tokens (SOL, USDC, JUP, BONK), 60 req/min limit, ~40-45 seconds execution time
+
+**Files**:
+- `README.md`: Updated "Project Status" → "Stage 1" section (line 13-14)
+- `README.md`: Fixed `max_cycle_length: 3` → `4` in config.json example (line 104)
+- `README.md`: Enhanced "Scan Mode" section with configuration and performance details (lines 112-123)
+- `README.md`: Updated `.env` file example with complete parameter list (lines 67-88)
+- `README.md`: Updated "Risk & Capital Management" → "Minimum profit" section (lines 175-177)
+- `README.md`: Updated "How It Works" → "Opportunity search" section (lines 211-216)
+- `README.md`: Updated "Limitations" section (lines 241-246)
+- `CHANGES.md`: Added entry documenting README.md updates
+
+### 24. Refactoring: 20 Predefined Cycles, Remove Hardcoded Addresses, Stream Processing, Symbol Display ✅
+
+**Problem**: Code used hardcoded token addresses throughout, automatic cycle generation created too many cycles, and output showed addresses instead of readable symbols. No stream processing for immediate opportunity handling.
+
+**Fix**:
+- **Removed hardcoded addresses**: All token addresses now come from config.json only (removed fallback hardcoded addresses in main.py)
+- **20 predefined cycles in config.json**: Added cycles section in config.json with 20 predefined 3-leg cycles in symbol format (14 with USDC base, 6 with SOL base)
+- **Cycle conversion**: Added `convert_cycles_to_addresses()` method to convert cycles from symbols to addresses using tokens_config
+- **Stream processing**: Added `find_opportunities_stream()` async generator in ArbitrageFinder and `scan_opportunities_stream()` in Trader for immediate opportunity processing
+- **Symbol display**: Added `format_cycle_with_symbols()` method in Trader to display cycles using token symbols instead of addresses (e.g., "BONK -> SOL -> USDC -> BONK")
+- **Updated simulate/live modes**: Both modes now use stream processing for immediate handling of found opportunities
+- **Removed FIXED_CYCLES**: Deleted hardcoded FIXED_CYCLES constant, cycles are loaded from config.json
+- **Removed auto-generation**: Removed automatic cycle generation methods, using predefined cycles from config instead
+
+**Files**:
+- `config.json`: Added 20 cycles in symbol format under `arbitrage.cycles`, added 6 new tokens (WIF, RAY, ORCA, PYTH, POPCAT, MNGO) to tokens section
+- `src/arbitrage_finder.py`: Removed FIXED_CYCLES and `_generate_cycles()` method, added `cycles` and `tokens_config` parameters to `__init__()`, added `convert_cycles_to_addresses()` method, added `find_opportunities_stream()` async generator, updated `find_opportunities()` to use cycles from config
+- `src/main.py`: Removed hardcoded token addresses (fallback tokens), removed hardcoded sol_mint and usdc_mint, load cycles from config.json, create address_to_symbol dictionary for Trader, updated simulate/live modes to use stream processing, updated output to use format_cycle_with_symbols
+- `src/trader.py`: Added `address_to_symbol` parameter to `__init__()`, added `format_cycle_with_symbols()` method, added `scan_opportunities_stream()` async generator, updated all output locations to use format_cycle_with_symbols
+- `src/jupiter_client.py`: Added comment explaining hardcoded SOL/USDC addresses in get_sol_price_usdc() are acceptable (well-known constants for specialized method)
+- `CHANGES.md`: Added entry documenting refactoring
+
+**Note**: All token addresses now come from config.json only. Cycles are defined in symbols and converted to addresses automatically. Stream processing allows immediate handling of opportunities without waiting for all cycles to complete. Display uses readable symbols instead of long addresses.
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -385,7 +455,7 @@
 ✅ All RiskConfig attributes synchronized (no AttributeError)
 ✅ Jupiter API uses working DNS endpoint (api.jup.ag)
 ✅ Jupiter API uses correct endpoint format (/swap/v1/quote)
-✅ Minimal scan configuration: 4 tokens, 6 fixed cycles, sequential processing with delays (quota-safe)
+✅ Optimized scan configuration: 4 tokens, 12 fixed cycles, sequential processing with configurable delays (rate-limited: 36 requests in ~40-45 seconds, safely within 60 req/min limit)
 ✅ Slippage is configurable via `.env` (`SLIPPAGE_BPS`, `DIAGNOSTIC_SLIPPAGE_BPS`) with validation against `MAX_SLIPPAGE_BPS`
 ✅ Improved slippage validation and logging: explicit warnings when `MAX_SLIPPAGE_BPS` is not set, detailed error messages with instructions, final configuration summary
 ✅ Centralized SOL/USDC price fetching method: no code duplication, automatic price fetching at startup, reusable for diagnostic mode
@@ -397,3 +467,6 @@
 ✅ Critical bugs fixed: simulation validation now uses actual quote values instead of comparing with itself, profit filtering explicitly checks `min_profit_bps > 0` before applying filter
 ✅ Security checks added before transaction execution: quote expiry validation (last_valid_block_height) and balance re-check prevent execution with stale quotes or insufficient balance
 ✅ Diagnostic mode configuration: `DIAGNOSTIC_AMOUNT_SOL` variable added for configurable diagnostic request amount (default: 1.0 SOL)
+✅ Jupiter API rate limiting optimized: increased cycles from 6 to 12 (doubled coverage), configurable `QUOTE_DELAY_SECONDS` delay (1.0 sec default for 60 req/min limit), optimized delays from 0.2 sec to 1.0 sec, rate-limited scan respects API quotas (36 requests in ~40-45 seconds, safely within 60 req/min limit)
+✅ README.md updated: accurately reflects optimized rate limiting configuration (12 cycles, 3-leg format, 4 tokens, 60 req/min limit, ~40-45 seconds execution time), complete parameter documentation, clarified PRIMARY/SECONDARY profit logic
+✅ Refactoring: 20 predefined cycles in config.json (symbol format), removed all hardcoded token addresses (uses config.json only), added stream processing (async generators) for immediate opportunity handling, added symbol display (format_cycle_with_symbols) showing readable token names instead of addresses, updated simulate/live modes to use stream processing

@@ -348,6 +348,10 @@ class JupiterClient:
             If return_full_quote=False: float price (USDC per SOL) or None if failed
             If return_full_quote=True: JupiterQuote object or None if failed
         """
+        # NOTE: Hardcoded addresses for SOL and USDC are acceptable here
+        # as this is a specialized method for fetching SOL price only.
+        # These are well-known constants for native SOL and USDC.
+        # For arbitrage cycles, addresses come from config.json.
         sol_mint = "So11111111111111111111111111111111111111112"
         usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         amount = int(amount_sol * 1e9)  # Convert SOL to lamports

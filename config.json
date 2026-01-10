@@ -3,13 +3,41 @@
     "SOL": "So11111111111111111111111111111111111111112",
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
-    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+    "ORCA": "orcaEKTdK7LKz57vaAYr9QeNsVEPfiu6QeMU1kektZE",
+    "PYTH": "HZ1JovNiVvGrGNiiYvEozEVgZ58xaU3RKwX8eACQBCt3",
+    "POPCAT": "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr",
+    "MNGO": "MangoCzJ36AjZyKwVj3VnYU4GTonjfVEnJmvvWaxLac"
   },
   "arbitrage": {
     "min_profit_usdc": 0.1,
     "max_cycle_length": 4,
     "max_cycles": 100,
-    "quote_timeout": 5.0
+    "quote_timeout": 5.0,
+    "cycles": [
+      ["USDC", "SOL", "JUP", "USDC"],
+      ["USDC", "SOL", "BONK", "USDC"],
+      ["USDC", "SOL", "WIF", "USDC"],
+      ["USDC", "SOL", "RAY", "USDC"],
+      ["USDC", "JUP", "SOL", "USDC"],
+      ["USDC", "JUP", "BONK", "USDC"],
+      ["USDC", "JUP", "WIF", "USDC"],
+      ["USDC", "JUP", "RAY", "USDC"],
+      ["USDC", "BONK", "SOL", "USDC"],
+      ["USDC", "BONK", "JUP", "USDC"],
+      ["USDC", "BONK", "WIF", "USDC"],
+      ["USDC", "BONK", "RAY", "USDC"],
+      ["USDC", "WIF", "SOL", "USDC"],
+      ["USDC", "WIF", "JUP", "USDC"],
+      ["SOL", "USDC", "JUP", "SOL"],
+      ["SOL", "USDC", "BONK", "SOL"],
+      ["SOL", "USDC", "WIF", "SOL"],
+      ["SOL", "JUP", "BONK", "SOL"],
+      ["SOL", "JUP", "WIF", "SOL"],
+      ["SOL", "BONK", "WIF", "SOL"]
+    ]
   },
   "simulation": {
     "enabled": true,

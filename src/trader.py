@@ -5,7 +5,7 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List, AsyncIterator
 
 from .jupiter_client import JupiterClient
 from .solana_client import SolanaClient
@@ -27,7 +27,8 @@ class Trader:
         priority_fee_lamports: int = 0,
         use_jito: bool = False,
         mode: str = 'scan',  # 'scan', 'simulate', or 'live'
-        slippage_bps: int = 50
+        slippage_bps: int = 50,
+        address_to_symbol: Optional[Dict[str, str]] = None
     ):
         self.jupiter = jupiter_client
         self.solana = solana_client
@@ -38,6 +39,28 @@ class Trader:
         self.mode = mode.lower()
         self.trade_in_progress = False  # Protection against parallel trades
         self.slippage_bps = slippage_bps
+        self.address_to_symbol = address_to_symbol or {}  # Dictionary mapping address -> symbol
+    
+    def format_cycle_with_symbols(self, cycle_addresses: List[str]) -> str:
+        """
+        Convert cycle from addresses to string with token symbols.
+        
+        Args:
+            cycle_addresses: List of token addresses [address1, address2, address3, address1]
+        
+        Returns:
+            String in format "BONK -> SOL -> USDC -> BONK"
+            If address is not found in dictionary, shows first 8 characters + "..."
+        """
+        symbols = []
+        for address in cycle_addresses:
+            # Use reverse dictionary address -> symbol
+            symbol = self.address_to_symbol.get(address)
+            if symbol is None:
+                # Fallback: show first 8 characters of address
+                symbol = address[:8] + "..."
+            symbols.append(symbol)
+        return " -> ".join(symbols)
     
     async def scan_opportunities(
         self,
@@ -54,12 +77,43 @@ class Trader:
         logger.info(f"Found {len(opportunities)} opportunities")
         for i, opp in enumerate(opportunities, 1):
             logger.info(
-                f"  {i}. Cycle: {' -> '.join(opp.cycle)} | "
+                f"  {i}. Cycle: {self.format_cycle_with_symbols(opp.cycle)} | "
                 f"Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f}) | "
                 f"Impact: {opp.price_impact_total:.2f}%"
             )
         
         return opportunities
+    
+    async def scan_opportunities_stream(
+        self,
+        start_token: str,
+        amount: int,
+        max_opportunities: int = 10
+    ) -> AsyncIterator[ArbitrageOpportunity]:
+        """
+        Scan for opportunities and yield them as they are found.
+        
+        This method uses async generator to yield opportunities immediately
+        as they are found, allowing stream processing without waiting
+        for all cycles to complete.
+        
+        Args:
+            start_token: Starting token mint address
+            amount: Starting amount in smallest unit
+            max_opportunities: Maximum number of opportunities to yield
+        
+        Yields:
+            ArbitrageOpportunity as they are found
+        """
+        logger.info(f"Scanning for opportunities (stream mode): {amount/1e9:.4f} SOL")
+        
+        async for opportunity in self.finder.find_opportunities_stream(start_token, amount, max_opportunities):
+            logger.info(
+                f"Found opportunity: Cycle: {self.format_cycle_with_symbols(opportunity.cycle)} | "
+                f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
+                f"Impact: {opportunity.price_impact_total:.2f}%"
+            )
+            yield opportunity
     
     async def simulate_opportunity(
         self,
@@ -72,7 +126,7 @@ class Trader:
         Returns:
             (success: bool, error_message: Optional[str], simulation_result: Optional[Dict])
         """
-        logger.info(f"Simulating opportunity: {' -> '.join(opportunity.cycle)}")
+        logger.info(f"Simulating opportunity: {self.format_cycle_with_symbols(opportunity.cycle)}")
         
         # Build swap transaction for the full cycle
         # Note: Jupiter doesn't support multi-leg swaps directly,
@@ -133,7 +187,7 @@ class Trader:
         
         position_id = str(uuid.uuid4())
         
-        logger.info(f"Executing opportunity: {' -> '.join(opportunity.cycle)}")
+        logger.info(f"Executing opportunity: {self.format_cycle_with_symbols(opportunity.cycle)}")
         logger.info(f"Position ID: {position_id}")
         
         # Set trade_in_progress flag BEFORE any operations

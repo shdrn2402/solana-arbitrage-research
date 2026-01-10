@@ -139,6 +139,7 @@ async def main():
     slippage_bps = int(slippage_bps_env) if (slippage_bps_env and slippage_bps_env.strip()) else 50
     slippage_bps_original = slippage_bps  # Сохраняем для сравнения после валидации
     diagnostic_slippage_bps = int(os.getenv('DIAGNOSTIC_SLIPPAGE_BPS', '500'))
+    quote_delay_seconds = float(os.getenv('QUOTE_DELAY_SECONDS', '1.0'))
     
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
     # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
@@ -205,31 +206,39 @@ async def main():
         risk_manager.update_wallet_balance(balance)
         logger.info(f"Wallet balance: {balance / 1e9:.4f} SOL")
     
-    # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
+    # Get tokens from config (no hardcoded addresses)
     tokens_config = config.get('tokens', {})
+    if not tokens_config:
+        logger.error("No tokens found in config.json. Please configure tokens in config.json")
+        return
+    
     tokens = list(tokens_config.values())
-    if not tokens:
-        # Default minimal tokens (quota-safe)
-        tokens = [
-            "So11111111111111111111111111111111111111112",  # SOL
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-        ]
+    
+    # Load cycles from config (symbols format)
+    arbitrage_config = config.get('arbitrage', {})
+    cycles = arbitrage_config.get('cycles', [])
+    if not cycles:
+        logger.warning("No cycles found in config.json.arbitrage.cycles. Using empty list.")
+        cycles = []
     
     # Initialize arbitrage finder
-    arbitrage_config = config.get('arbitrage', {})
     finder = ArbitrageFinder(
         jupiter,
         tokens,
+        cycles=cycles,  # Cycles in symbol format
+        tokens_config=tokens_config,  # Dictionary mapping symbol -> address
         min_profit_bps=risk_config.min_profit_bps,
         min_profit_usd=risk_config.min_profit_usdc,  # Use min_profit_usdc from RiskConfig
         max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
         max_cycles=arbitrage_config.get('max_cycles', 100),
         quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
         slippage_bps=slippage_bps,
-        sol_price_usdc=risk_config.sol_price_usdc
+        sol_price_usdc=risk_config.sol_price_usdc,
+        quote_delay_seconds=quote_delay_seconds
     )
+    
+    # Create reverse dictionary: address -> symbol (for displaying cycles)
+    address_to_symbol = {address: symbol for symbol, address in tokens_config.items()}
     
     # Initialize trader with mode for safety checks
     trader = Trader(
@@ -240,7 +249,8 @@ async def main():
         priority_fee_lamports=priority_fee,
         use_jito=use_jito,
         mode=mode,  # Pass mode for strict checking
-        slippage_bps=slippage_bps
+        slippage_bps=slippage_bps,
+        address_to_symbol=address_to_symbol  # Dictionary mapping address -> symbol for display
     )
     
     # DIAGNOSTIC MODE: Test if Jupiter can return routes at all
@@ -301,14 +311,11 @@ async def main():
         return
     
     # Determine starting token and amount
-    # Prefer SOL or USDC as base token for cycles
-    sol_mint = "So11111111111111111111111111111111111111112"
-    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-    
-    if sol_mint in tokens:
-        start_token = sol_mint
-    elif usdc_mint in tokens:
-        start_token = usdc_mint
+    # Prefer SOL or USDC as base token for cycles (from config, no hardcoded addresses)
+    if "SOL" in tokens_config and tokens_config["SOL"] in tokens:
+        start_token = tokens_config["SOL"]
+    elif "USDC" in tokens_config and tokens_config["USDC"] in tokens:
+        start_token = tokens_config["USDC"]
     else:
         start_token = tokens[0]  # Fallback to first token
     
@@ -323,7 +330,7 @@ async def main():
     try:
         if mode == 'scan':
             logger.info("Mode: SCAN (read-only)")
-            logger.info("Minimal scan: tokens=4 cycles=6 (quota-safe)")
+            logger.info(f"Optimized scan: {len(tokens_config)} tokens, {len(cycles)} cycles, delay={quote_delay_seconds}s (rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
@@ -334,7 +341,7 @@ async def main():
                 logger.info(f"\nFound {len(opportunities)} profitable opportunities:")
                 for i, opp in enumerate(opportunities, 1):
                     logger.info(
-                        f"\n{i}. Cycle: {' -> '.join(opp.cycle)}"
+                        f"\n{i}. Cycle: {trader.format_cycle_with_symbols(opp.cycle)}"
                         f"\n   Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f})"
                         f"\n   Initial: {opp.initial_amount / 1e9:.6f} SOL"
                         f"\n   Final: {opp.final_amount / 1e9:.6f} SOL"
@@ -349,18 +356,17 @@ async def main():
                 logger.error("Wallet required for simulation")
                 return
             
-            opportunities = await trader.scan_opportunities(
+            # Use stream mode for immediate processing
+            user_pubkey = str(wallet.pubkey())
+            async for opp in trader.scan_opportunities_stream(
                 start_token,
                 test_amount,
                 max_opportunities=5
-            )
-            
-            for opp in opportunities:
-                user_pubkey = str(wallet.pubkey())
+            ):
                 success, error, sim_result = await trader.simulate_opportunity(opp, user_pubkey)
                 
                 if success:
-                    logger.info(f"Simulation successful for cycle: {' -> '.join(opp.cycle)}")
+                    logger.info(f"Simulation successful for cycle: {trader.format_cycle_with_symbols(opp.cycle)}")
                     logger.debug(f"Simulation result: {sim_result}")
                 else:
                     logger.warning(f"Simulation failed: {error}")
@@ -388,25 +394,25 @@ async def main():
                     balance = await solana.get_balance()
                     risk_manager.update_wallet_balance(balance)
                     
-                    # Find opportunities
-                    opportunities = await trader.scan_opportunities(
+                    # Use stream mode for immediate processing
+                    user_pubkey = str(wallet.pubkey())
+                    found_opportunity = False
+                    async for opp in trader.scan_opportunities_stream(
                         start_token,
                         test_amount,
                         max_opportunities=1
-                    )
-                    
-                    if opportunities:
-                        opp = opportunities[0]
-                        user_pubkey = str(wallet.pubkey())
-                        
+                    ):
+                        found_opportunity = True
                         # Execute
                         success, error, tx_sig = await trader.execute_opportunity(opp, user_pubkey)
                         
                         if success:
-                            logger.info(f"Successfully executed arbitrage: {tx_sig}")
+                            logger.info(f"Successfully executed arbitrage: Cycle: {trader.format_cycle_with_symbols(opp.cycle)}, TX: {tx_sig}")
                         else:
-                            logger.warning(f"Execution failed: {error}")
-                    else:
+                            logger.warning(f"Execution failed for cycle {trader.format_cycle_with_symbols(opp.cycle)}: {error}")
+                        break  # Execute only first opportunity
+                    
+                    if not found_opportunity:
                         logger.info("No opportunities found, waiting...")
                     
                     # Wait before next iteration

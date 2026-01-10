@@ -4,7 +4,7 @@ Searches for A -> B -> C -> A cycles (3-leg cycles) with profit.
 """
 import asyncio
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, AsyncIterator
 from dataclasses import dataclass
 import time
 
@@ -46,49 +46,34 @@ class ArbitrageOpportunity:
 class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
-    # Fixed minimal cycle set for quota-safe scanning
-    # Only 6 predefined 3-leg cycles (A->B->C->A format) using 4 tokens: SOL, USDC, JUP, BONK
-    FIXED_CYCLES = [
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112",  # SOL
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
-        ["JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"],  # JUP
-        ["DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"]  # BONK
-    ]
-    
     def __init__(
         self,
         jupiter_client: JupiterClient,
         tokens: List[str],
+        cycles: List[List[str]],  # Cycles in symbol format [["USDC", "SOL", "JUP", "USDC"], ...]
+        tokens_config: Dict[str, str],  # Dictionary mapping symbol -> address
         min_profit_bps: int = 50,
         min_profit_usd: float = 0.1,
         max_cycle_length: int = 4,
         max_cycles: int = 100,
         quote_timeout: float = 5.0,
         slippage_bps: int = 50,
-        sol_price_usdc: float = 100.0
+        sol_price_usdc: float = 100.0,
+        quote_delay_seconds: float = 1.0
     ):
+        """
+        Initialize arbitrage finder.
+        
+        Args:
+            jupiter_client: Jupiter API client
+            tokens: List of token mint addresses
+            cycles: List of cycles in symbol format (from config.json)
+            tokens_config: Dictionary mapping token symbols to addresses
+        """
         self.jupiter = jupiter_client
         self.tokens = tokens
+        self.cycles_symbols = cycles  # Cycles in symbol format
+        self.tokens_config = tokens_config
         self.min_profit_bps = min_profit_bps
         self.min_profit_usd = min_profit_usd
         self.max_cycle_length = max_cycle_length
@@ -96,6 +81,34 @@ class ArbitrageFinder:
         self.quote_timeout = quote_timeout
         self.slippage_bps = slippage_bps
         self.sol_price_usdc = sol_price_usdc
+        self.quote_delay_seconds = quote_delay_seconds
+        
+        # Convert cycles from symbols to addresses
+        self.cycles_addresses = self.convert_cycles_to_addresses(cycles, tokens_config)
+    
+    def convert_cycles_to_addresses(self, cycles_symbols: List[List[str]], tokens_config: Dict[str, str]) -> List[List[str]]:
+        """
+        Convert cycles from symbols to addresses.
+        
+        Args:
+            cycles_symbols: Cycles in symbol format [["USDC", "SOL", "JUP", "USDC"], ...]
+            tokens_config: Dictionary mapping symbol -> address
+        
+        Returns:
+            Cycles in address format [["address1", "address2", ...], ...]
+        
+        Raises:
+            ValueError: If any token symbol is not found in tokens_config
+        """
+        cycles_addresses = []
+        for cycle_symbols in cycles_symbols:
+            cycle_addresses = []
+            for symbol in cycle_symbols:
+                if symbol not in tokens_config:
+                    raise ValueError(f"Token {symbol} not found in config.tokens")
+                cycle_addresses.append(tokens_config[symbol])
+            cycles_addresses.append(cycle_addresses)
+        return cycles_addresses
     
     async def find_opportunities(
         self,
@@ -116,8 +129,8 @@ class ArbitrageFinder:
         """
         opportunities = []
         
-        # Use fixed minimal cycle set (quota-safe: only 6 cycles)
-        cycles = self.FIXED_CYCLES
+        # Use cycles from config (already converted to addresses in init)
+        cycles = self.cycles_addresses
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
         
@@ -128,61 +141,53 @@ class ArbitrageFinder:
             if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
                 opportunities.append(result)
             
-            # Delay between cycles to avoid quota spikes (150-250ms)
-            await asyncio.sleep(0.2)
+            # Delay between cycles for rate limiting (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
+            await asyncio.sleep(self.quote_delay_seconds)
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.profit_bps, reverse=True)
         
         return opportunities[:max_opportunities]
     
-    def _generate_cycles(
+    async def find_opportunities_stream(
         self,
         start_token: str,
-        tokens: List[str],
-        max_length: int
-    ) -> List[List[str]]:
+        amount: int,
+        max_opportunities: int = 10
+    ) -> AsyncIterator[ArbitrageOpportunity]:
         """
-        Generate cycles starting from start_token.
+        Find opportunities and yield them as they are found (async generator).
         
-        Avoids trivial symmetric cycles (A -> B -> A).
-        Supports cycles of length 3-4 legs.
-        Limits total number of cycles to avoid combinatorial explosion.
+        Yields opportunities immediately for processing (simulation/execution).
+        This allows stream processing without waiting for all cycles to complete.
+        
+        Args:
+            start_token: Starting token mint address
+            amount: Starting amount in smallest unit
+            max_opportunities: Maximum number of opportunities to yield
+        
+        Yields:
+            ArbitrageOpportunity as they are found
         """
-        cycles = []
+        found_count = 0
         
-        # Remove start_token from tokens list for intermediate steps
-        other_tokens = [t for t in tokens if t != start_token]
+        # Use cycles from config (already converted to addresses in init)
+        cycles = self.cycles_addresses
         
-        if len(other_tokens) < 2:
-            return cycles
+        logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities (stream mode)...")
         
-        # A -> B -> C -> A (3-leg cycles)
-        # Skip trivial A -> B -> A cycles
-        if max_length >= 3:
-            for token1 in other_tokens:
-                for token2 in other_tokens:
-                    if token1 != token2:
-                        cycle = [start_token, token1, token2, start_token]
-                        cycles.append(cycle)
-                        if len(cycles) >= self.max_cycles:
-                            return cycles
-        
-        # A -> B -> C -> D -> A (4-leg cycles)
-        if max_length >= 4 and len(other_tokens) >= 3:
-            for token1 in other_tokens:
-                for token2 in other_tokens:
-                    if token1 == token2:
-                        continue
-                    for token3 in other_tokens:
-                        if token3 == token1 or token3 == token2:
-                            continue
-                        cycle = [start_token, token1, token2, token3, start_token]
-                        cycles.append(cycle)
-                        if len(cycles) >= self.max_cycles:
-                            return cycles
-        
-        return cycles
+        for cycle in cycles:
+            result = await self._check_cycle(cycle, amount)
+            
+            if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
+                found_count += 1
+                yield result
+                
+                if found_count >= max_opportunities:
+                    break
+            
+            # Delay between cycles for rate limiting (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
+            await asyncio.sleep(self.quote_delay_seconds)
     
     async def _check_cycle(
         self,
@@ -222,9 +227,9 @@ class ArbitrageFinder:
                 quotes.append(quote)
                 current_amount = quote.out_amount
                 
-                # Delay between quote requests within a cycle (150-250ms)
+                # Delay between quote requests within a cycle (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
                 if i < len(cycle) - 2:  # Don't delay after last leg
-                    await asyncio.sleep(0.2)
+                    await asyncio.sleep(self.quote_delay_seconds)
             
             # Calculate profit
             final_amount = current_amount
