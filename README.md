@@ -91,7 +91,7 @@ Additional settings:
     "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
   },
   "arbitrage": {
-    "min_profit_usd": 0.1,
+    "min_profit_usdc": 0.1,
     "max_cycle_length": 3,
     "quote_timeout": 5.0
   }
@@ -165,7 +165,7 @@ The bot includes a comprehensive risk management system:
 
 2. **Minimum profit**
    - In basis points (`MIN_PROFIT_BPS`)
-   - In USD (`min_profit_usd` in config.json)
+   - In USDC (`min_profit_usdc` in config.json)
 
 3. **Slippage control**
    - Maximum slippage (`MAX_SLIPPAGE_BPS`)
@@ -258,7 +258,7 @@ src/
 
 ### No opportunities found
 - This is normal behavior. Public aggregator APIs may return no routes even for liquid pairs.
-- Try increasing `MIN_PROFIT_BPS` or decreasing `min_profit_usd`
+- Try increasing `MIN_PROFIT_BPS` or decreasing `min_profit_usdc`
 
 ## License
 

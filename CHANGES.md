@@ -223,6 +223,23 @@
 - `src/arbitrage_finder.py`: Updated method comment to remove placeholder mention
 - `src/main.py`: Pass `sol_price_usdc=risk_config.sol_price_usdc` parameter when creating `ArbitrageFinder` (line 215)
 
+### 14. Configuration Name Consistency Fix ✅
+
+**Problem**: Inconsistent naming between `.env` (`MIN_PROFIT_USDC`) and `config.json` (`min_profit_usd`). This created confusion and inconsistency in naming conventions.
+
+**Fix**:
+- Renamed `min_profit_usd` to `min_profit_usdc` in `config.json` for consistency with `.env` variable naming
+- Updated code to use `min_profit_usdc` key when reading from `config.json`
+- All profit minimum values now use USDC naming convention consistently across all configuration files
+- Updated documentation in `README.md` to reflect the new naming convention
+
+**Files**:
+- `config.json`: Renamed `min_profit_usd` → `min_profit_usdc` in arbitrage section (line 9)
+- `src/main.py`: Updated `config.get()` to use `min_profit_usdc` key (line 99)
+- `README.md`: Updated all mentions of `min_profit_usd` to `min_profit_usdc` (lines 94, 168, 261)
+
+**Note**: After this change, old configs with `min_profit_usd` will use the default value (0.1) instead of reading from config. This is acceptable as `.env` takes precedence, and the change improves naming consistency.
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -238,3 +255,4 @@
 ✅ Improved slippage validation and logging: explicit warnings when `MAX_SLIPPAGE_BPS` is not set, detailed error messages with instructions, final configuration summary
 ✅ Centralized SOL/USDC price fetching method: no code duplication, automatic price fetching at startup, reusable for diagnostic mode
 ✅ ArbitrageFinder uses actual SOL price from config (auto-fetched from Jupiter API or `.env`): correct profit calculations regardless of SOL price, no hardcoded values
+✅ Consistent naming convention: all profit minimum values use `usdc` suffix consistently across `.env`, `config.json`, and code

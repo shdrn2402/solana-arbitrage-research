@@ -96,7 +96,7 @@ async def main():
     if min_profit_usdc_env:
         min_profit_usdc = float(min_profit_usdc_env)
     else:
-        min_profit_usdc = config.get('arbitrage', {}).get('min_profit_usd', 0.1)
+        min_profit_usdc = config.get('arbitrage', {}).get('min_profit_usdc', 0.1)
     
     # Read MAX_SLIPPAGE_BPS with check for explicit setting
     max_slippage_bps_env = os.getenv('MAX_SLIPPAGE_BPS')
