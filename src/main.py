@@ -225,7 +225,7 @@ async def main():
         tokens,
         min_profit_bps=risk_config.min_profit_bps,
         min_profit_usd=risk_config.min_profit_usdc,  # Use min_profit_usdc from RiskConfig
-        max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
+        max_cycle_length=arbitrage_config.get('max_cycle_length', 5),
         max_cycles=arbitrage_config.get('max_cycles', 100),
         quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
         slippage_bps=slippage_bps,
@@ -325,7 +325,7 @@ async def main():
     try:
         if mode == 'scan':
             logger.info("Mode: SCAN (read-only)")
-            logger.info(f"Optimized scan: tokens=4 cycles=12 delay={quote_delay_seconds}s (rate-limited: {int(60/quote_delay_seconds)} req/min)")
+            logger.info(f"Optimized scan: cycles=12 (6 three-leg + 6 four-leg, all USDC-based) delay={quote_delay_seconds}s (42 requests in ~42s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,

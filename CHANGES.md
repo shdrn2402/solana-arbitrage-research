@@ -421,6 +421,31 @@
 - `README.md`: Updated "Limitations" section (lines 241-246)
 - `CHANGES.md`: Added entry documenting README.md updates
 
+### 23. Refactor All Cycles to Start and End in USDC ✅
+
+**Problem**: Current cycles had inconsistent starting/ending tokens (SOL, USDC, JUP, BONK), making it harder to compare opportunities and manage risk. Additionally, only 3-leg cycles were used, limiting arbitrage coverage.
+
+**Fix**:
+- Refactored all 12 cycles to start and end in USDC (stablecoin baseline)
+- Implemented mixed cycle format: 6 three-leg cycles (USDC → X → Y → USDC) + 6 four-leg cycles (USDC → X → Y → Z → USDC)
+- Used 3 intermediate tokens: SOL, JUP, BONK (all 6 unique combinations for 3-leg, all 6 unique permutations for 4-leg)
+- Updated `max_cycle_length` from 4 to 5 to support 4-leg cycles (5 elements: USDC, X, Y, Z, USDC)
+- Total requests: 42 (6×3 + 6×4) in ~42 seconds with 1.0s delay (safely within 60 req/min limit)
+- Updated all comments, docstrings, and logging to reflect new cycle format
+- All cycles now use USDC as baseline for profit calculation and risk management
+
+**Files**:
+- `src/arbitrage_finder.py`: Replaced all 12 cycles in `FIXED_CYCLES` (6 three-leg + 6 four-leg, all USDC-based, lines 52-111)
+- `src/arbitrage_finder.py`: Updated module docstring (line 3) - removed "3-leg cycles only" mention
+- `src/arbitrage_finder.py`: Updated `ArbitrageOpportunity.cycle` comment (line 19) - reflects mixed format
+- `src/arbitrage_finder.py`: Updated `_check_cycle` docstring (line 223) - supports both 3-leg and 4-leg
+- `src/arbitrage_finder.py`: Updated `FIXED_CYCLES` comment (lines 49-51) - 42 requests in ~42 seconds
+- `src/arbitrage_finder.py`: Updated `__init__` default `max_cycle_length` from 4 to 5 (line 119)
+- `src/main.py`: Updated `max_cycle_length` default from 4 to 5 (line 228)
+- `src/main.py`: Updated scan mode logging to reflect new cycle format (line 328)
+- `config.json`: Updated `max_cycle_length` from 4 to 5 (line 10)
+- `CHANGES.md`: Added entry documenting cycle refactoring
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -445,3 +470,4 @@
 ✅ Diagnostic mode configuration: `DIAGNOSTIC_AMOUNT_SOL` variable added for configurable diagnostic request amount (default: 1.0 SOL)
 ✅ Jupiter API rate limiting optimized: increased cycles from 6 to 12 (doubled coverage), configurable `QUOTE_DELAY_SECONDS` delay (1.0 sec default for 60 req/min limit), optimized delays from 0.2 sec to 1.0 sec, rate-limited scan respects API quotas (36 requests in ~40-45 seconds, safely within 60 req/min limit)
 ✅ README.md updated: accurately reflects optimized rate limiting configuration (12 cycles, 3-leg format, 4 tokens, 60 req/min limit, ~40-45 seconds execution time), complete parameter documentation, clarified PRIMARY/SECONDARY profit logic
+✅ All cycles refactored to start and end in USDC: 6 three-leg cycles (USDC → X → Y → USDC) + 6 four-leg cycles (USDC → X → Y → Z → USDC), using SOL/JUP/BONK as intermediate tokens, 42 requests in ~42 seconds, `max_cycle_length` updated to 5, all comments and logging updated

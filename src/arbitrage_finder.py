@@ -1,6 +1,6 @@
 """
 Arbitrage opportunity finder.
-Searches for A -> B -> C -> A cycles (3-leg cycles) with profit.
+Searches for cycles starting and ending in USDC (3-leg and 4-leg formats) with profit.
 """
 import asyncio
 import logging
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ArbitrageOpportunity:
     """Represents an arbitrage opportunity."""
-    cycle: List[str]  # [token1, token2, token3, token1] - 3-leg cycle with 4 elements
+    cycle: List[str]  # [USDC, X, Y, USDC] or [USDC, X, Y, Z, USDC] - 3-leg or 4-leg cycle starting and ending in USDC
     quotes: List[JupiterQuote]
     initial_amount: int
     final_amount: int
@@ -47,57 +47,67 @@ class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
     # Fixed cycle set for quota-optimized scanning (rate limit: 60 req/min)
-    # 12 predefined 3-leg cycles (A->B->C->A format) using 4 tokens: SOL, USDC, JUP, BONK
-    # With 1.0 sec delay between requests: 12 cycles × 3 requests = 36 requests in ~40-45 seconds
+    # 12 predefined cycles (6 three-leg + 6 four-leg) all starting and ending in USDC
+    # Format: USDC → X → Y → USDC (3-leg) and USDC → X → Y → Z → USDC (4-leg)
+    # Using 3 tokens: SOL, JUP, BONK (intermediate tokens, USDC is start/end)
+    # With 1.0 sec delay between requests: 12 cycles × 3.5 avg requests = 42 requests in ~42 seconds
     FIXED_CYCLES = [
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
+        # 3-leg cycles: USDC → X → Y → USDC (6 unique combinations)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112",  # SOL
          "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112"],  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
         ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
          "So11111111111111111111111111111111111111112",  # SOL
          "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
-        ["JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"],  # JUP
-        ["DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"],  # BONK
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112"],  # SOL
-        ["So11111111111111111111111111111111111111112",  # SOL
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112"],  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
         ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
          "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
          "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
         ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
          "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
          "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC
-        ["JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
+        # 4-leg cycles: USDC → X → Y → Z → USDC (6 unique permutations)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112",  # SOL
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "So11111111111111111111111111111111111111112",  # SOL
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "So11111111111111111111111111111111111111112",  # SOL
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
          "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
          "So11111111111111111111111111111111111111112",  # SOL
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"]  # JUP
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "So11111111111111111111111111111111111111112",  # SOL
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
+        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+         "So11111111111111111111111111111111111111112",  # SOL
+         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]  # USDC (4-leg)
     ]
     
     def __init__(
@@ -106,7 +116,7 @@ class ArbitrageFinder:
         tokens: List[str],
         min_profit_bps: int = 50,
         min_profit_usd: float = 0.1,
-        max_cycle_length: int = 4,
+        max_cycle_length: int = 5,
         max_cycles: int = 100,
         quote_timeout: float = 5.0,
         slippage_bps: int = 50,
@@ -220,7 +230,7 @@ class ArbitrageFinder:
         Check if a cycle is profitable.
         
         Args:
-            cycle: List of token mints [A, B, C, A] (3-leg cycle, 4 elements total)
+            cycle: List of token mints [USDC, X, Y, USDC] or [USDC, X, Y, Z, USDC] (3-leg or 4-leg cycle, all starting and ending in USDC)
             initial_amount: Starting amount in smallest unit
         
         Returns:
