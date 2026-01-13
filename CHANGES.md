@@ -446,6 +446,129 @@
 - `config.json`: Updated `max_cycle_length` from 4 to 5 (line 10)
 - `CHANGES.md`: Added entry documenting cycle refactoring
 
+### 24. Automatic Cycle Generation for Top 10 Tokens ✅
+
+**Problem**: Current configuration used fixed list of cycles (FIXED_CYCLES), requiring manual updates when tokens changed. Limited coverage with only 12-20 predefined cycles.
+
+**Fix**:
+- Replaced fixed cycle list with automatic generation of all possible 3-leg cycles
+- Expanded token universe from 4-6 tokens to 10 top Solana tokens (excluding USDT)
+- Added tokens: WIF, RAY, ORCA, PYTH, POPCAT, MNGO (in addition to SOL, USDC, JUP, BONK)
+- Implemented automatic cycle generation based on base tokens (USDC and SOL only)
+- Generation logic: for each base token, generates all pairs of intermediate tokens (X → Y, where X != Y)
+- Result: 144 cycles total (72 for USDC base + 72 for SOL base)
+- All cycles are 3-leg format (4 elements: base → X → Y → base)
+- Execution time: 144 cycles × 3 requests = 432 requests in ~7 minutes (with 1.0 sec delay, exactly 1 req/sec)
+
+**Files**:
+- `config.json`: Added 6 new tokens (WIF, RAY, ORCA, PYTH, POPCAT, MNGO), total 10 tokens
+- `src/arbitrage_finder.py`: Removed FIXED_CYCLES constant, added `generate_all_cycles()` method, updated `find_opportunities()` to use generated cycles
+- `src/arbitrage_finder.py`: Added `base_tokens` parameter to `__init__` (default: ["USDC", "SOL"])
+- `src/arbitrage_finder.py`: Added `token_map` parameter to `__init__` for symbol mapping
+- `src/main.py`: Updated to pass `token_map` and `base_tokens` to `ArbitrageFinder`, updated logging to reflect auto-generation
+- `CHANGES.md`: Added entry documenting automatic cycle generation
+
+**Note**: Automatic generation provides maximum coverage - all possible 3-leg cycles are checked. Execution time increased to ~7 minutes but provides complete arbitrage opportunity coverage. Base tokens are limited to USDC and SOL for optimal liquidity and stability.
+
+### 25. Display Token Symbols Instead of Addresses in Output ✅
+
+**Problem**: Cycle output showed long token addresses (mint addresses), making it hard to read and understand arbitrage opportunities. Example: `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v -> So11111111111111111111111111111111111111112 -> JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN`.
+
+**Fix**:
+- Added `format_cycle_with_symbols()` function to convert token addresses to symbols
+- Created reverse mapping `tokens_map` (address → symbol) from `tokens_config`
+- Applied transformation to all cycle outputs in scan and simulate modes
+- If address not found in mapping, address is displayed as-is (fallback)
+- Result: cycles now display as readable symbols (e.g., `USDC -> SOL -> JUP -> USDC`)
+
+**Files**:
+- `src/main.py`: Added `format_cycle_with_symbols()` function (line 47)
+- `src/main.py`: Created `tokens_map` reverse mapping after loading `tokens_config` (line 328)
+- `src/main.py`: Applied transformation to cycle output in scan mode (line 458)
+- `src/main.py`: Applied transformation to cycle output in simulate mode (line 486)
+- `CHANGES.md`: Added entry documenting token symbol display
+
+**Note**: Symbol mapping is based on `config.json` tokens section. Unknown tokens (not in config) are displayed as addresses for transparency.
+
+### 26. Colored Terminal Output for Results, Balances, and SOL Price ✅
+
+**Problem**: Important information (profits, balances, opportunities count) was displayed in plain text, making it hard to quickly identify key values in terminal output.
+
+**Fix**:
+- Added color support with TTY detection (`sys.stdout.isatty()`) - colors only in terminal, not in log files
+- Color scheme:
+  - GREEN: numeric values (amounts, counts, bps, percentages)
+  - CYAN: labels/names (Cycle, Profit, Initial, Final, SOL balance, USDC balance)
+  - YELLOW: important values (SOL price in USD, profit in USD)
+  - RED: errors/warnings (no opportunities, zero count)
+- Applied colors to:
+  - SOL price: `$142.92 USDC` (price in YELLOW)
+  - SOL balance: `SOL balance: 0.3090 SOL` (label CYAN, amount GREEN)
+  - USDC balance: `USDC balance: 36.26 USDC` (label CYAN, amount GREEN)
+  - Opportunities count: number colored GREEN if > 0, RED if 0
+  - Opportunity details: labels CYAN, values GREEN/YELLOW
+  - "No profitable opportunities found": RED
+  - "Bot stopped": YELLOW
+
+**Files**:
+- `src/main.py`: Added color constants (GREEN, CYAN, YELLOW, RED, RESET) with TTY detection (line 91-96)
+- `src/main.py`: Applied colors to SOL price output (line 195)
+- `src/main.py`: Applied colors to SOL balance output (line 210)
+- `src/main.py`: Applied colors to USDC balance output (line 309)
+- `src/main.py`: Applied colors to opportunities count and details (lines 441-451)
+- `src/main.py`: Applied colors to "No profitable opportunities found" (line 454)
+- `src/main.py`: Applied colors to "Bot stopped" message (line 559)
+- `src/trader.py`: Added `_get_colors()` function for color support (line 17)
+- `src/trader.py`: Applied colors to "Found N opportunities" output (line 57)
+- `CHANGES.md`: Added entry documenting colored output
+
+**Note**: Colors are automatically disabled when output is redirected to files (log files remain clean without ANSI codes). TTY detection ensures colors only appear in interactive terminals.
+
+### 27. Display USDC Balance in Wallet ✅
+
+**Problem**: Bot only displayed SOL balance, but many arbitrage opportunities require USDC. Users had no visibility into their USDC balance without external tools.
+
+**Fix**:
+- Added USDC balance retrieval using Solana RPC `get_token_accounts_by_owner()`
+- Filters by Token Program ID to get all SPL token accounts
+- Parses raw base64-encoded account data to extract mint address and amount
+- Finds USDC account by comparing mint address: `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`
+- Extracts amount from account data (8 bytes at offset 64, little-endian u64)
+- Converts to UI amount: `amount / 1e6` (USDC has 6 decimals)
+- Displays balance: `USDC balance: 36.26 USDC` (with colored output)
+- Handles errors gracefully: shows `0.00 USDC` if retrieval fails
+
+**Files**:
+- `src/main.py`: Added USDC balance retrieval logic after SOL balance check (lines 209-312)
+- `src/main.py`: Uses `get_token_accounts_by_owner()` with `TokenAccountOpts(program_id=token_program_id)`
+- `src/main.py`: Manual parsing of raw account data (base64 decode, struct unpack for mint and amount)
+- `src/main.py`: USDC balance display with colored output (line 309)
+- `CHANGES.md`: Added entry documenting USDC balance display
+
+**Note**: USDC balance retrieval uses raw account data parsing because `solana-py` library's `AsyncClient` doesn't support `encoding="jsonParsed"` parameter. Manual parsing extracts mint address (32 bytes) and amount (8 bytes at offset 64) from 165-byte SPL Token Account structure.
+
+### 28. Move Cycles to config.json and Use Fixed 20 Three-Leg Cycles ✅
+
+**Problem**: Cycles were hardcoded in `FIXED_CYCLES` constant in `arbitrage_finder.py`, making it difficult to modify cycles without code changes. Previous automatic generation (144 cycles) was too slow (~7 minutes). Needed a balance between coverage and execution time.
+
+**Fix**:
+- Removed `FIXED_CYCLES` constant from `arbitrage_finder.py`
+- Added `cycles` section to `config.json` with 20 predefined three-leg cycles
+- Added tokens WIF and RAY to `config.json` tokens section
+- Changed cycle configuration: 20 three-leg cycles (14 USDC-based + 6 SOL-based)
+- Updated `ArbitrageFinder` to accept `cycles` parameter in constructor (loaded from config)
+- Updated `max_cycle_length` from 5 to 4 (correct for 3-leg cycles)
+- Added warning if cycles are not found in config.json
+- Updated logging to show cycle breakdown (USDC-based vs SOL-based) and execution time
+
+**Files**:
+- `config.json`: Added WIF and RAY tokens, added `cycles` section with 20 three-leg cycles (14 USDC-based, 6 SOL-based), updated `max_cycle_length` to 4
+- `src/arbitrage_finder.py`: Removed `FIXED_CYCLES` constant, added `cycles` parameter to `__init__`, updated `find_opportunities()` to use `self.cycles`, updated default `max_cycle_length` to 4
+- `src/main.py`: Added loading of cycles from `config.get('cycles', [])`, pass `cycles=cycles` to `ArbitrageFinder`, updated scan mode logging to show cycle breakdown
+- `CHANGES.md`: Added entry documenting cycle configuration migration
+
+**Note**: Cycles are now configurable via `config.json` without code changes. 20 cycles × 3 requests = 60 requests in ~60 seconds (with 1.0 sec delay, exactly 1 req/sec, safely within 60 req/min limit). This provides good coverage while maintaining reasonable execution time.
+
 ## Result
 
 ✅ Limit logic is consistent (all in USDC)
@@ -471,3 +594,8 @@
 ✅ Jupiter API rate limiting optimized: increased cycles from 6 to 12 (doubled coverage), configurable `QUOTE_DELAY_SECONDS` delay (1.0 sec default for 60 req/min limit), optimized delays from 0.2 sec to 1.0 sec, rate-limited scan respects API quotas (36 requests in ~40-45 seconds, safely within 60 req/min limit)
 ✅ README.md updated: accurately reflects optimized rate limiting configuration (12 cycles, 3-leg format, 4 tokens, 60 req/min limit, ~40-45 seconds execution time), complete parameter documentation, clarified PRIMARY/SECONDARY profit logic
 ✅ All cycles refactored to start and end in USDC: 6 three-leg cycles (USDC → X → Y → USDC) + 6 four-leg cycles (USDC → X → Y → Z → USDC), using SOL/JUP/BONK as intermediate tokens, 42 requests in ~42 seconds, `max_cycle_length` updated to 5, all comments and logging updated
+✅ Automatic cycle generation for top 10 tokens: replaced fixed cycles with dynamic generation of all possible 3-leg cycles (144 cycles: 72 for USDC base + 72 for SOL base), expanded token universe to 10 tokens (SOL, USDC, JUP, BONK, WIF, RAY, ORCA, PYTH, POPCAT, MNGO), execution time: ~7 minutes (432 requests with 1.0 sec delay)
+✅ Token symbols displayed instead of addresses: cycles now show readable symbols (e.g., `USDC -> SOL -> JUP -> USDC`) instead of long mint addresses, reverse mapping from `config.json` tokens section, fallback to address if symbol not found
+✅ Colored terminal output: GREEN for numbers, CYAN for labels, YELLOW for important values (prices, profits), RED for errors/warnings, TTY detection ensures colors only in terminal (not in log files), applied to balances, prices, opportunities count, and all output messages
+✅ USDC balance display: retrieves USDC balance from SPL token accounts using Solana RPC, parses raw account data to extract mint and amount, displays with colored output, graceful error handling with fallback to 0.00 USDC
+✅ Cycles moved to config.json: removed FIXED_CYCLES hardcoded constant, added cycles section to config.json with 20 three-leg cycles (14 USDC-based + 6 SOL-based), added WIF and RAY tokens, cycles now configurable without code changes, execution time: 60 requests in ~60 seconds (1 req/sec, safely within 60 req/min limit)

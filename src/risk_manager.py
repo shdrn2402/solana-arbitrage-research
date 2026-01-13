@@ -16,13 +16,13 @@ class RiskConfig:
     All absolute limits are in USDC for consistency.
     SOL amounts are converted to USDC using sol_price_usdc.
     """
-    max_position_size_percent: float = 10.0
-    max_position_size_absolute_usdc: float = 100.0  # in USDC (was 1.0 SOL, ~$100)
-    min_profit_usdc: float = 0.1  # PRIMARY: minimum profit in USDC (absolute)
-    min_profit_bps: int = 50  # SECONDARY: optional filter in basis points
-    max_slippage_bps: int = 50  # maximum allowed slippage
-    max_active_positions: int = 1
-    sol_price_usdc: float = 100.0  # SOL price in USDC for conversion
+    max_position_size_percent: float
+    max_position_size_absolute_usdc: float  # in USDC
+    min_profit_usdc: float  # PRIMARY: minimum profit in USDC (absolute)
+    min_profit_bps: int  # SECONDARY: optional filter in basis points
+    max_slippage_bps: int  # maximum allowed slippage
+    max_active_positions: int
+    sol_price_usdc: float  # SOL price in USDC for conversion
 
 
 @dataclass
@@ -48,7 +48,7 @@ class RiskManager:
     def update_wallet_balance(self, balance_lamports: int):
         """Update wallet balance from network."""
         self.wallet_balance = balance_lamports
-        logger.info(f"Wallet balance updated: {balance_lamports / 1e9:.4f} SOL")
+        logger.info(f"Wallet balance updated!")
     
     def get_available_balance(self) -> int:
         """Get available balance (total - locked)."""

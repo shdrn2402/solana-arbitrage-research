@@ -3,6 +3,7 @@ Main trading module that orchestrates arbitrage execution.
 """
 import asyncio
 import logging
+import sys
 import time
 import uuid
 from typing import Optional, Dict, Any, Tuple
@@ -13,6 +14,16 @@ from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
 
 logger = logging.getLogger(__name__)
+
+
+def _get_colors() -> Dict[str, str]:
+    """Get color codes for terminal output (empty if not TTY)."""
+    use_color = sys.stdout.isatty()
+    return {
+        'GREEN': '\033[92m' if use_color else '',
+        'RED': '\033[91m' if use_color else '',
+        'RESET': '\033[0m' if use_color else ''
+    }
 
 
 class Trader:
@@ -51,7 +62,10 @@ class Trader:
             start_token, amount, max_opportunities
         )
         
-        logger.info(f"Found {len(opportunities)} opportunities")
+        colors = _get_colors()
+        count = len(opportunities)
+        count_color = colors['GREEN'] if count > 0 else colors['RED']
+        logger.info(f"Found {count_color}{count}{colors['RESET']} opportunities")
         for i, opp in enumerate(opportunities, 1):
             logger.info(
                 f"  {i}. Cycle: {' -> '.join(opp.cycle)} | "

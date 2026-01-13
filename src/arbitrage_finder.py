@@ -46,82 +46,19 @@ class ArbitrageOpportunity:
 class ArbitrageFinder:
     """Finds arbitrage opportunities using Jupiter API."""
     
-    # Fixed cycle set for quota-optimized scanning (rate limit: 60 req/min)
-    # 12 predefined cycles (6 three-leg + 6 four-leg) all starting and ending in USDC
-    # Format: USDC → X → Y → USDC (3-leg) and USDC → X → Y → Z → USDC (4-leg)
-    # Using 3 tokens: SOL, JUP, BONK (intermediate tokens, USDC is start/end)
-    # With 1.0 sec delay between requests: 12 cycles × 3.5 avg requests = 42 requests in ~42 seconds
-    FIXED_CYCLES = [
-        # 3-leg cycles: USDC → X → Y → USDC (6 unique combinations)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112",  # SOL
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112",  # SOL
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (3-leg)
-        # 4-leg cycles: USDC → X → Y → Z → USDC (6 unique permutations)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112",  # SOL
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "So11111111111111111111111111111111111111112",  # SOL
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112",  # SOL
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "So11111111111111111111111111111111111111112",  # SOL
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"],  # USDC (4-leg)
-        ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-         "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
-         "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
-         "So11111111111111111111111111111111111111112",  # SOL
-         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"]  # USDC (4-leg)
-    ]
-    
     def __init__(
         self,
         jupiter_client: JupiterClient,
         tokens: List[str],
         min_profit_bps: int = 50,
         min_profit_usd: float = 0.1,
-        max_cycle_length: int = 5,
+        max_cycle_length: int = 4,
         max_cycles: int = 100,
         quote_timeout: float = 5.0,
         slippage_bps: int = 50,
         sol_price_usdc: float = 100.0,
-        quote_delay_seconds: float = 1.0
+        quote_delay_seconds: float = 1.0,
+        cycles: List[List[str]] = None
     ):
         self.jupiter = jupiter_client
         self.tokens = tokens
@@ -133,6 +70,7 @@ class ArbitrageFinder:
         self.slippage_bps = slippage_bps
         self.sol_price_usdc = sol_price_usdc
         self.quote_delay_seconds = quote_delay_seconds
+        self.cycles = cycles or []  # Load cycles from config.json
     
     async def find_opportunities(
         self,
@@ -153,8 +91,12 @@ class ArbitrageFinder:
         """
         opportunities = []
         
-        # Use fixed cycle set (quota-optimized: 12 cycles with configurable delays)
-        cycles = self.FIXED_CYCLES
+        # Use cycles from config.json (loaded via constructor)
+        cycles = self.cycles
+        
+        if not cycles:
+            logger.warning("No cycles configured. Please add cycles to config.json")
+            return []
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
         

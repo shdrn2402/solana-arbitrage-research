@@ -44,6 +44,15 @@ def load_config() -> dict:
     return config
 
 
+def format_cycle_with_symbols(cycle: list[str], tokens_map: dict) -> str:
+    """Convert cycle addresses to token symbols."""
+    symbols = []
+    for addr in cycle:
+        symbol = tokens_map.get(addr, addr)  # Use symbol if found, otherwise use address
+        symbols.append(symbol)
+    return ' -> '.join(symbols)
+
+
 def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
     """Load wallet from private key."""
     if not private_key_str:
@@ -87,6 +96,14 @@ async def main():
             logging.FileHandler('arbitrage_bot.log')
         ]
     )
+    
+    # Color support for terminal output (skip colors when output is redirected)
+    use_color = sys.stdout.isatty()
+    GREEN = '\033[92m' if use_color else ''  # For numbers/amounts
+    CYAN = '\033[96m' if use_color else ''   # For labels/names
+    YELLOW = '\033[93m' if use_color else ''  # For important values (prices, profits)
+    RED = '\033[91m' if use_color else ''     # For errors/warnings (no opportunities)
+    RESET = '\033[0m' if use_color else ''
     
     logger.info("Starting Solana Arbitrage Bot")
     logger.debug(f"Log level set to: {log_level_str}")
@@ -185,7 +202,7 @@ async def main():
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
     if sol_price_auto and sol_price_auto > 0:
         sol_price_usdc = sol_price_auto
-        logger.info(f"SOL price fetched from Jupiter API: ${sol_price_usdc:.2f} USDC")
+        logger.info(f"SOL price fetched from Jupiter API: {YELLOW}${sol_price_usdc:.2f} USDC{RESET}")
         # Update risk_config with fetched price
         risk_config.sol_price_usdc = sol_price_usdc
         # Recalculate max_position_absolute_usdc with updated price
@@ -204,11 +221,111 @@ async def main():
     if wallet:
         balance = await solana.get_balance()
         risk_manager.update_wallet_balance(balance)
-        logger.info(f"Wallet balance: {balance / 1e9:.4f} SOL")
+        logger.info(f"{CYAN}SOL balance: {GREEN}{balance / 1e9:.4f} SOL{RESET}")
+        
+        # Get USDC balance
+        try:
+            from solana.rpc.commitment import Confirmed
+            from solana.rpc.types import TokenAccountOpts
+            
+            usdc_mint_str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            token_program_id = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            wallet_pubkey = wallet.pubkey()
+            
+            # Get all SPL token accounts by owner with programId filter
+            # Note: get_token_accounts_by_owner doesn't support encoding parameter
+            # We'll get raw data and parse it manually
+            from solana.rpc.types import TokenAccountOpts
+            
+            result = await solana.client.get_token_accounts_by_owner(
+                wallet_pubkey,
+                TokenAccountOpts(program_id=token_program_id),
+                commitment=Confirmed
+            )
+            
+            usdc_balance = 0.0
+            if result.value:
+                logger.debug(f"Found {len(result.value)} token accounts")
+                # Iterate through all token accounts to find USDC
+                for idx, account_info in enumerate(result.value):
+                    try:
+                        # Parse raw account data
+                        # SPL Token Account structure:
+                        # - mint: Pubkey (32 bytes, offset 0)
+                        # - owner: Pubkey (32 bytes, offset 32)
+                        # - amount: u64 (8 bytes, offset 64)
+                        from base64 import b64decode
+                        import struct
+                        
+                        # Get account data (base64 encoded bytes)
+                        account_data = account_info.account.data
+                        logger.debug(f"Account {idx}: data type = {type(account_data)}")
+                        
+                        # Handle different data formats
+                        account_data_bytes = None
+                        if isinstance(account_data, list) and len(account_data) > 0:
+                            # Format: ["base64string", "base58"]
+                            account_data_bytes = b64decode(account_data[0])
+                        elif isinstance(account_data, str):
+                            # Format: "base64string"
+                            account_data_bytes = b64decode(account_data)
+                        elif hasattr(account_data, '__bytes__'):
+                            # If it's already bytes
+                            account_data_bytes = bytes(account_data)
+                        elif hasattr(account_data, '__iter__') and not isinstance(account_data, (str, bytes)):
+                            # Try to get first element if it's iterable
+                            try:
+                                data_list = list(account_data)
+                                if len(data_list) > 0 and isinstance(data_list[0], str):
+                                    account_data_bytes = b64decode(data_list[0])
+                            except Exception as decode_err:
+                                logger.debug(f"Account {idx}: decode error: {decode_err}")
+                                pass
+                        
+                        if account_data_bytes is None:
+                            logger.debug(f"Account {idx}: could not decode data, type={type(account_data)}, repr={repr(account_data)[:100]}")
+                            continue
+                        
+                        logger.debug(f"Account {idx}: decoded data length = {len(account_data_bytes)}")
+                        
+                        # SPL Token Account is 165 bytes total
+                        if len(account_data_bytes) < 72:
+                            logger.debug(f"Account {idx}: data too short ({len(account_data_bytes)} bytes)")
+                            continue
+                        
+                        # Extract mint (first 32 bytes)
+                        mint_bytes = account_data_bytes[0:32]
+                        mint_pubkey = Pubkey.from_bytes(mint_bytes)
+                        mint = str(mint_pubkey)
+                        
+                        logger.debug(f"Account {idx}: mint = {mint}")
+                        
+                        # Compare with USDC mint address
+                        if mint == usdc_mint_str:
+                            # Extract amount (8 bytes, offset 64)
+                            # Use little-endian unsigned long long (Q)
+                            amount_bytes = account_data_bytes[64:72]
+                            amount = struct.unpack('<Q', amount_bytes)[0]  # u64 little-endian
+                            usdc_balance = amount / 1e6  # USDC has 6 decimals
+                            logger.debug(f"USDC found! Raw amount: {amount}, UI amount: {usdc_balance}")
+                            break  # USDC found, exit loop
+                    except Exception as e:
+                        logger.debug(f"Error parsing token account {idx}: {e}", exc_info=True)
+                        continue
+            else:
+                logger.debug("No token accounts found in result.value")
+            
+            logger.info(f"{CYAN}USDC balance: {GREEN}{usdc_balance:.2f} USDC{RESET}")
+        except Exception as e:
+            logger.warning(f"Could not retrieve USDC balance: {e}", exc_info=True)
+            logger.info("USDC balance: 0.00 USDC")
     
     # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
     tokens_config = config.get('tokens', {})
     tokens = list(tokens_config.values())
+    
+    # Create reverse mapping: address -> symbol
+    tokens_map = {v: k for k, v in tokens_config.items()}
     if not tokens:
         # Default minimal tokens (quota-safe)
         tokens = [
@@ -218,6 +335,11 @@ async def main():
             "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
         ]
     
+    # Load cycles from config.json
+    cycles = config.get('cycles', [])
+    if not cycles:
+        logger.warning("No cycles found in config.json. Please add cycles section to config.json")
+    
     # Initialize arbitrage finder
     arbitrage_config = config.get('arbitrage', {})
     finder = ArbitrageFinder(
@@ -225,12 +347,13 @@ async def main():
         tokens,
         min_profit_bps=risk_config.min_profit_bps,
         min_profit_usd=risk_config.min_profit_usdc,  # Use min_profit_usdc from RiskConfig
-        max_cycle_length=arbitrage_config.get('max_cycle_length', 5),
+        max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
         max_cycles=arbitrage_config.get('max_cycles', 100),
         quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
         slippage_bps=slippage_bps,
         sol_price_usdc=risk_config.sol_price_usdc,
-        quote_delay_seconds=quote_delay_seconds
+        quote_delay_seconds=quote_delay_seconds,
+        cycles=cycles
     )
     
     # Initialize trader with mode for safety checks
@@ -325,25 +448,33 @@ async def main():
     try:
         if mode == 'scan':
             logger.info("Mode: SCAN (read-only)")
-            logger.info(f"Optimized scan: cycles=12 (6 three-leg + 6 four-leg, all USDC-based) delay={quote_delay_seconds}s (42 requests in ~42s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
+            usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+            sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
+            logger.info(f"Optimized scan: cycles={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
                 max_opportunities=10
+            
             )
             
+            count = len(opportunities)
+            count_color = GREEN if count > 0 else RED
+            if count > 0:
+                logger.info(f"Found {count_color}{count}{RESET} profitable opportunities:")
+            
             if opportunities:
-                logger.info(f"\nFound {len(opportunities)} profitable opportunities:")
                 for i, opp in enumerate(opportunities, 1):
+                    cycle_str = format_cycle_with_symbols(opp.cycle, tokens_map)
                     logger.info(
-                        f"\n{i}. Cycle: {' -> '.join(opp.cycle)}"
-                        f"\n   Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f})"
-                        f"\n   Initial: {opp.initial_amount / 1e9:.6f} SOL"
-                        f"\n   Final: {opp.final_amount / 1e9:.6f} SOL"
-                        f"\n   Price Impact: {opp.price_impact_total:.2f}%"
+                        f"\n{CYAN}{i}. Cycle:{RESET} {cycle_str}"
+                        f"\n   {CYAN}Profit:{RESET} {GREEN}{opp.profit_bps} bps{RESET} ({YELLOW}${opp.profit_usd:.4f}{RESET})"
+                        f"\n   {CYAN}Initial:{RESET} {GREEN}{opp.initial_amount / 1e9:.6f} SOL{RESET}"
+                        f"\n   {CYAN}Final:{RESET} {GREEN}{opp.final_amount / 1e9:.6f} SOL{RESET}"
+                        f"\n   {CYAN}Price Impact:{RESET} {GREEN}{opp.price_impact_total:.2f}%{RESET}"
                     )
             else:
-                logger.info("No profitable opportunities found")
+                logger.info(f"{RED}No profitable opportunities found{RESET}")
         
         elif mode == 'simulate':
             logger.info("Mode: SIMULATE")
@@ -362,7 +493,8 @@ async def main():
                 success, error, sim_result = await trader.simulate_opportunity(opp, user_pubkey)
                 
                 if success:
-                    logger.info(f"Simulation successful for cycle: {' -> '.join(opp.cycle)}")
+                    cycle_str = format_cycle_with_symbols(opp.cycle, tokens_map)
+                    logger.info(f"Simulation successful for cycle: {cycle_str}")
                     logger.debug(f"Simulation result: {sim_result}")
                 else:
                     logger.warning(f"Simulation failed: {error}")
@@ -428,7 +560,7 @@ async def main():
         # Cleanup
         await jupiter.close()
         await solana.close()
-        logger.info("Bot stopped")
+        logger.info(f"{YELLOW}Bot stopped{RESET}")
 
 
 if __name__ == '__main__':
