@@ -156,3 +156,6 @@ local_test/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
+
+# Documentation
+TODO.md
