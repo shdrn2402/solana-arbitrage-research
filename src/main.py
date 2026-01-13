@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 
 import dotenv
 from solders.keypair import Keypair
@@ -21,6 +21,33 @@ from .trader import Trader
 
 # Logger will be initialized in main() after .env is loaded
 logger = logging.getLogger(__name__)
+# Suppress httpx HTTP request logs (too verbose)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def _get_colors() -> Dict[str, str]:
+    """
+    Get ANSI color codes if output is to TTY, otherwise return empty strings.
+    
+    Returns:
+        Dictionary with color codes: GREEN, CYAN, YELLOW, BOLD, RESET
+    """
+    if sys.stdout.isatty():
+        return {
+            'GREEN': '\033[92m',
+            'CYAN': '\033[96m',
+            'YELLOW': '\033[93m',
+            'BOLD': '\033[1m',
+            'RESET': '\033[0m'
+        }
+    else:
+        return {
+            'GREEN': '',
+            'CYAN': '',
+            'YELLOW': '',
+            'BOLD': '',
+            'RESET': ''
+        }
 
 
 def load_config() -> dict:
@@ -337,18 +364,24 @@ async def main():
                 max_opportunities=10
             )
             
+            # Get colors for TTY output
+            colors = _get_colors()
+            
             if opportunities:
-                logger.info(f"\nFound {len(opportunities)} profitable opportunities:")
+                logger.info(
+                    f"\n{colors['BOLD']}{colors['GREEN']}Found {len(opportunities)} profitable opportunities:{colors['RESET']}"
+                )
                 for i, opp in enumerate(opportunities, 1):
                     logger.info(
-                        f"\n{i}. Cycle: {trader.format_cycle_with_symbols(opp.cycle)}"
-                        f"\n   Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f})"
+                        f"\n{colors['YELLOW']}{i}.{colors['RESET']} "
+                        f"Cycle: {colors['CYAN']}{trader.format_cycle_with_symbols(opp.cycle)}{colors['RESET']}"
+                        f"\n   Profit: {colors['GREEN']}{opp.profit_bps} bps (${opp.profit_usd:.4f}){colors['RESET']}"
                         f"\n   Initial: {opp.initial_amount / 1e9:.6f} SOL"
                         f"\n   Final: {opp.final_amount / 1e9:.6f} SOL"
                         f"\n   Price Impact: {opp.price_impact_total:.2f}%"
                     )
             else:
-                logger.info("No profitable opportunities found")
+                logger.info(f"{colors['YELLOW']}No profitable opportunities found{colors['RESET']}")
         
         elif mode == 'simulate':
             logger.info("Mode: SIMULATE")

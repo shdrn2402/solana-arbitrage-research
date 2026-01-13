@@ -3,6 +3,7 @@ Main trading module that orchestrates arbitrage execution.
 """
 import asyncio
 import logging
+import sys
 import time
 import uuid
 from typing import Optional, Dict, Any, Tuple, List, AsyncIterator
@@ -13,6 +14,31 @@ from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
 
 logger = logging.getLogger(__name__)
+
+
+def _get_colors() -> Dict[str, str]:
+    """
+    Get ANSI color codes if output is to TTY, otherwise return empty strings.
+    
+    Returns:
+        Dictionary with color codes: GREEN, CYAN, YELLOW, BOLD, RESET
+    """
+    if sys.stdout.isatty():
+        return {
+            'GREEN': '\033[92m',
+            'CYAN': '\033[96m',
+            'YELLOW': '\033[93m',
+            'BOLD': '\033[1m',
+            'RESET': '\033[0m'
+        }
+    else:
+        return {
+            'GREEN': '',
+            'CYAN': '',
+            'YELLOW': '',
+            'BOLD': '',
+            'RESET': ''
+        }
 
 
 class Trader:
@@ -74,11 +100,13 @@ class Trader:
             start_token, amount, max_opportunities
         )
         
-        logger.info(f"Found {len(opportunities)} opportunities")
+        colors = _get_colors()
+        logger.info(f"{colors['BOLD']}{colors['GREEN']}Found {len(opportunities)} opportunities{colors['RESET']}")
         for i, opp in enumerate(opportunities, 1):
             logger.info(
-                f"  {i}. Cycle: {self.format_cycle_with_symbols(opp.cycle)} | "
-                f"Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f}) | "
+                f"  {colors['YELLOW']}{i}.{colors['RESET']} "
+                f"Cycle: {colors['CYAN']}{self.format_cycle_with_symbols(opp.cycle)}{colors['RESET']} | "
+                f"Profit: {colors['GREEN']}{opp.profit_bps} bps (${opp.profit_usd:.4f}){colors['RESET']} | "
                 f"Impact: {opp.price_impact_total:.2f}%"
             )
         
