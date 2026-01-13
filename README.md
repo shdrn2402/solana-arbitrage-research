@@ -74,7 +74,8 @@ Main parameters (see `env.example` for complete list):
 RPC_URL=https://api.mainnet-beta.solana.com
 
 # Operation Mode
-MODE=scan  # scan, simulate, or live
+# Note: Mode is now specified via command line argument (default: scan)
+# Usage: python run.py [scan|simulate|live]
 
 # Wallet private key (base58, required for simulate/live modes)
 WALLET_PRIVATE_KEY=your_private_key_here
@@ -132,6 +133,10 @@ Additional settings:
 Read-only mode for analyzing potential arbitrage paths without executing transactions:
 
 ```bash
+# Default mode (scan is used if no argument provided)
+python run.py
+
+# Or explicitly specify scan mode
 python run.py scan
 ```
 
@@ -183,7 +188,7 @@ Runs a single direct quote request to verify that the aggregator API
 can build swap routes, then exits immediately.
 
 ```bash
-DIAGNOSTIC_MODE=true python run.py
+DIAGNOSTIC_MODE=true python run.py scan
 ```
 
 ## Risk & Capital Management

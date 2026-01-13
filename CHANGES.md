@@ -470,6 +470,8 @@
 
 **Note**: Automatic generation provides maximum coverage - all possible 3-leg cycles are checked. Execution time increased to ~7 minutes but provides complete arbitrage opportunity coverage. Base tokens are limited to USDC and SOL for optimal liquidity and stability.
 
+**Important**: This change was later reverted in change #28 due to execution time being too long (~7 minutes). The final solution uses 20 fixed cycles from config.json instead (14 USDC-based + 6 SOL-based, 6 tokens: SOL, USDC, JUP, BONK, WIF, RAY).
+
 ### 25. Display Token Symbols Instead of Addresses in Output ✅
 
 **Problem**: Cycle output showed long token addresses (mint addresses), making it hard to read and understand arbitrage opportunities. Example: `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v -> So11111111111111111111111111111111111111112 -> JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN`.
@@ -567,7 +569,29 @@
 - `src/main.py`: Added loading of cycles from `config.get('cycles', [])`, pass `cycles=cycles` to `ArbitrageFinder`, updated scan mode logging to show cycle breakdown
 - `CHANGES.md`: Added entry documenting cycle configuration migration
 
-**Note**: Cycles are now configurable via `config.json` without code changes. 20 cycles × 3 requests = 60 requests in ~60 seconds (with 1.0 sec delay, exactly 1 req/sec, safely within 60 req/min limit). This provides good coverage while maintaining reasonable execution time.
+**Note**: Cycles are now configurable via `config.json` without code changes. 20 cycles × 3 requests = 60 requests in ~60 seconds (with 1.0 sec delay, exactly 1 req/sec, safely within 60 req/min limit). This provides good coverage while maintaining reasonable execution time. Uses 6 tokens: SOL, USDC, JUP, BONK, WIF, RAY (ORCA, PYTH, POPCAT, MNGO from change #24 were removed as part of the revert).
+
+### 29. Command Line Arguments for Operation Modes ✅
+
+**Problem**: Operation mode was configured via `MODE` environment variable in `.env`, making it inconvenient to switch modes without editing configuration files. This also mixed configuration concerns (environment variables for settings vs. runtime behavior).
+
+**Fix**:
+- Added command line argument support using `argparse` in `run.py`
+- Mode is now specified as command line argument: `python run.py [scan|simulate|live]`
+- Default mode is `scan` (if no argument provided)
+- Removed `MODE` from `.env` (deprecated, but backward compatible with warning)
+- Updated `main()` function signature to accept `mode` parameter
+- Added validation: only `scan`, `simulate`, or `live` are allowed (enforced by argparse `choices`)
+- Added warning if `MODE` is still set in `.env` (but uses command line argument)
+
+**Files**:
+- `run.py`: Added `argparse` for command line argument parsing, mode argument with default 'scan' and choices validation
+- `src/main.py`: Changed `main()` signature to `async def main(mode: str = 'scan')`, removed `mode = os.getenv('MODE', 'scan')`, added warning for deprecated MODE env var
+- `env.example`: Removed `MODE=scan` line (mode is now specified via command line)
+- `README.md`: Updated examples to show command line usage, removed MODE from .env example
+- `CHANGES.md`: Added entry documenting command line argument support
+
+**Note**: `DIAGNOSTIC_MODE` remains in `.env` as it's a test flag, not an operation mode. Usage: `python run.py` (defaults to scan), `python run.py scan`, `python run.py simulate`, `python run.py live`. Backward compatibility: if `MODE` is set in `.env`, a warning is shown but command line argument takes precedence.
 
 ## Result
 
@@ -594,8 +618,9 @@
 ✅ Jupiter API rate limiting optimized: increased cycles from 6 to 12 (doubled coverage), configurable `QUOTE_DELAY_SECONDS` delay (1.0 sec default for 60 req/min limit), optimized delays from 0.2 sec to 1.0 sec, rate-limited scan respects API quotas (36 requests in ~40-45 seconds, safely within 60 req/min limit)
 ✅ README.md updated: accurately reflects optimized rate limiting configuration (12 cycles, 3-leg format, 4 tokens, 60 req/min limit, ~40-45 seconds execution time), complete parameter documentation, clarified PRIMARY/SECONDARY profit logic
 ✅ All cycles refactored to start and end in USDC: 6 three-leg cycles (USDC → X → Y → USDC) + 6 four-leg cycles (USDC → X → Y → Z → USDC), using SOL/JUP/BONK as intermediate tokens, 42 requests in ~42 seconds, `max_cycle_length` updated to 5, all comments and logging updated
-✅ Automatic cycle generation for top 10 tokens: replaced fixed cycles with dynamic generation of all possible 3-leg cycles (144 cycles: 72 for USDC base + 72 for SOL base), expanded token universe to 10 tokens (SOL, USDC, JUP, BONK, WIF, RAY, ORCA, PYTH, POPCAT, MNGO), execution time: ~7 minutes (432 requests with 1.0 sec delay)
+⚠️ Change #24 (automatic cycle generation with 144 cycles for 10 tokens) was reverted in #28 due to execution time constraints (~7 minutes). Final solution: 20 fixed cycles from config.json (6 tokens: SOL, USDC, JUP, BONK, WIF, RAY)
 ✅ Token symbols displayed instead of addresses: cycles now show readable symbols (e.g., `USDC -> SOL -> JUP -> USDC`) instead of long mint addresses, reverse mapping from `config.json` tokens section, fallback to address if symbol not found
 ✅ Colored terminal output: GREEN for numbers, CYAN for labels, YELLOW for important values (prices, profits), RED for errors/warnings, TTY detection ensures colors only in terminal (not in log files), applied to balances, prices, opportunities count, and all output messages
 ✅ USDC balance display: retrieves USDC balance from SPL token accounts using Solana RPC, parses raw account data to extract mint and amount, displays with colored output, graceful error handling with fallback to 0.00 USDC
 ✅ Cycles moved to config.json: removed FIXED_CYCLES hardcoded constant, added cycles section to config.json with 20 three-leg cycles (14 USDC-based + 6 SOL-based), added WIF and RAY tokens, cycles now configurable without code changes, execution time: 60 requests in ~60 seconds (1 req/sec, safely within 60 req/min limit)
+✅ Command line arguments for operation modes: mode is now specified via command line argument (python run.py [scan|simulate|live]), default mode is scan, removed MODE from .env (deprecated with backward compatibility warning), DIAGNOSTIC_MODE remains in .env as test flag

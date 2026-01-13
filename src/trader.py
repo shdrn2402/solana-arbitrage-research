@@ -3,7 +3,6 @@ Main trading module that orchestrates arbitrage execution.
 """
 import asyncio
 import logging
-import sys
 import time
 import uuid
 from typing import Optional, Dict, Any, Tuple
@@ -12,19 +11,12 @@ from .jupiter_client import JupiterClient
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
+from .utils import get_terminal_colors
+
+# Get terminal colors (empty if output is redirected)
+colors = get_terminal_colors()
 
 logger = logging.getLogger(__name__)
-
-
-def _get_colors() -> Dict[str, str]:
-    """Get color codes for terminal output (empty if not TTY)."""
-    use_color = sys.stdout.isatty()
-    return {
-        'GREEN': '\033[92m' if use_color else '',
-        'RED': '\033[91m' if use_color else '',
-        'RESET': '\033[0m' if use_color else ''
-    }
-
 
 class Trader:
     """Main trading orchestrator."""
@@ -54,15 +46,18 @@ class Trader:
         self,
         start_token: str,
         amount: int,
-        max_opportunities: int = 10
+        max_opportunities: int = 10,
+        sol_balance: float = 0.0,
+        usdc_balance: float = 0.0
     ) -> list[ArbitrageOpportunity]:
         """Scan for arbitrage opportunities (read-only)."""
-        logger.info(f"Scanning for opportunities: {amount/1e9:.4f} SOL")
+        sol_limit = sol_balance * self.risk.config.max_position_size_percent / 100
+        usdc_limit = usdc_balance * self.risk.config.max_position_size_percent / 100
+        logger.info(f"{colors['CYAN']}Scanning limits: {colors['YELLOW']}{sol_limit:.4f} SOL, {usdc_limit:.2f} USDC{colors['RESET']}")
         opportunities = await self.finder.find_opportunities(
             start_token, amount, max_opportunities
         )
         
-        colors = _get_colors()
         count = len(opportunities)
         count_color = colors['GREEN'] if count > 0 else colors['RED']
         logger.info(f"Found {count_color}{count}{colors['RESET']} opportunities")

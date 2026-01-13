@@ -18,6 +18,10 @@ from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder
 from .trader import Trader
+from .utils import get_terminal_colors
+
+# Get terminal colors (empty if output is redirected)
+colors = get_terminal_colors()
 
 # Logger will be initialized in main() after .env is loaded
 logger = logging.getLogger(__name__)
@@ -72,8 +76,13 @@ def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
         return None
 
 
-async def main():
-    """Main function."""
+async def main(mode: str = 'scan'):
+    """
+    Main function.
+    
+    Args:
+        mode: Operation mode - 'scan' (default), 'simulate', or 'live'
+    """
     # Load .env FIRST to read LOG_LEVEL before setting up logging
     env_path = Path(__file__).parent.parent / '.env'
     if env_path.exists():
@@ -96,16 +105,12 @@ async def main():
             logging.FileHandler('arbitrage_bot.log')
         ]
     )
+
     
-    # Color support for terminal output (skip colors when output is redirected)
-    use_color = sys.stdout.isatty()
-    GREEN = '\033[92m' if use_color else ''  # For numbers/amounts
-    CYAN = '\033[96m' if use_color else ''   # For labels/names
-    YELLOW = '\033[93m' if use_color else ''  # For important values (prices, profits)
-    RED = '\033[91m' if use_color else ''     # For errors/warnings (no opportunities)
-    RESET = '\033[0m' if use_color else ''
+    # Normalize mode to lowercase
+    mode = mode.lower()
     
-    logger.info("Starting Solana Arbitrage Bot")
+    logger.info(f"{colors['CYAN']}Starting Solana Arbitrage Bot in the {colors['YELLOW']}{mode} mode {colors['RESET']}")
     logger.debug(f"Log level set to: {log_level_str}")
     
     # Load configuration (will reload .env, but that's fine - dotenv doesn't overwrite existing vars)
@@ -117,7 +122,6 @@ async def main():
     # If set explicitly, that URL will be used (no fallback)
     jupiter_api_url = os.getenv('JUPITER_API_URL')  # None = use fallback
     jupiter_api_key = os.getenv('JUPITER_API_KEY')  # Optional API key for authenticated requests
-    mode = os.getenv('MODE', 'scan').lower()
     
     # Risk config - all limits in USDC for consistency
     sol_price_usdc = float(os.getenv('SOL_PRICE_USDC', '100.0'))  # Default SOL price
@@ -202,7 +206,7 @@ async def main():
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
     if sol_price_auto and sol_price_auto > 0:
         sol_price_usdc = sol_price_auto
-        logger.info(f"SOL price fetched from Jupiter API: {YELLOW}${sol_price_usdc:.2f} USDC{RESET}")
+        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API: {colors['YELLOW']}${sol_price_usdc:.2f} USDC{colors['RESET']}")
         # Update risk_config with fetched price
         risk_config.sol_price_usdc = sol_price_usdc
         # Recalculate max_position_absolute_usdc with updated price
@@ -217,11 +221,16 @@ async def main():
     # Initialize risk manager
     risk_manager = RiskManager(risk_config)
     
+    # Initialize balance variables
+    sol_balance = 0.0
+    usdc_balance = 0.0
+    
     # Update wallet balance
     if wallet:
         balance = await solana.get_balance()
         risk_manager.update_wallet_balance(balance)
-        logger.info(f"{CYAN}SOL balance: {GREEN}{balance / 1e9:.4f} SOL{RESET}")
+        sol_balance = balance / 1e9  # Convert from lamports to SOL
+        logger.info(f"{colors['CYAN']}SOL balance: {colors['YELLOW']}{sol_balance:.4f} SOL{colors['RESET']}")
         
         # Get USDC balance
         try:
@@ -243,7 +252,6 @@ async def main():
                 commitment=Confirmed
             )
             
-            usdc_balance = 0.0
             if result.value:
                 logger.debug(f"Found {len(result.value)} token accounts")
                 # Iterate through all token accounts to find USDC
@@ -315,7 +323,7 @@ async def main():
             else:
                 logger.debug("No token accounts found in result.value")
             
-            logger.info(f"{CYAN}USDC balance: {GREEN}{usdc_balance:.2f} USDC{RESET}")
+            logger.info(f"{colors['CYAN']}USDC balance: {colors['YELLOW']}{usdc_balance:.2f} USDC{colors['RESET']}")
         except Exception as e:
             logger.warning(f"Could not retrieve USDC balance: {e}", exc_info=True)
             logger.info("USDC balance: 0.00 USDC")
@@ -454,27 +462,28 @@ async def main():
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
-                max_opportunities=10
-            
+                max_opportunities=10,
+                sol_balance=sol_balance,
+                usdc_balance=usdc_balance
             )
             
             count = len(opportunities)
-            count_color = GREEN if count > 0 else RED
+            count_color = colors['GREEN'] if count > 0 else colors['RED']
             if count > 0:
-                logger.info(f"Found {count_color}{count}{RESET} profitable opportunities:")
+                logger.info(f"Found {count_color}{count}{colors['CYAN']} profitable opportunities:{colors['RESET']}")
             
             if opportunities:
                 for i, opp in enumerate(opportunities, 1):
                     cycle_str = format_cycle_with_symbols(opp.cycle, tokens_map)
                     logger.info(
-                        f"\n{CYAN}{i}. Cycle:{RESET} {cycle_str}"
-                        f"\n   {CYAN}Profit:{RESET} {GREEN}{opp.profit_bps} bps{RESET} ({YELLOW}${opp.profit_usd:.4f}{RESET})"
-                        f"\n   {CYAN}Initial:{RESET} {GREEN}{opp.initial_amount / 1e9:.6f} SOL{RESET}"
-                        f"\n   {CYAN}Final:{RESET} {GREEN}{opp.final_amount / 1e9:.6f} SOL{RESET}"
-                        f"\n   {CYAN}Price Impact:{RESET} {GREEN}{opp.price_impact_total:.2f}%{RESET}"
+                        f"\n{colors['CYAN']}{i}. Cycle:{colors['RESET']} {cycle_str}"
+                        f"\n   {colors['CYAN']}Profit:{colors['RESET']} {colors['GREEN']}{opp.profit_bps} bps{colors['RESET']} ({colors['YELLOW']}${opp.profit_usd:.4f}{colors['RESET']})"
+                        f"\n   {colors['CYAN']}Initial:{colors['RESET']} {colors['GREEN']}{opp.initial_amount / 1e9:.6f} SOL{colors['RESET']}"
+                        f"\n   {colors['CYAN']}Final:{colors['RESET']} {colors['GREEN']}{opp.final_amount / 1e9:.6f} SOL{colors['RESET']}"
+                        f"\n   {colors['CYAN']}Price Impact:{colors['RESET']} {colors['GREEN']}{opp.price_impact_total:.2f}%{colors['RESET']}"
                     )
             else:
-                logger.info(f"{RED}No profitable opportunities found{RESET}")
+                logger.info(f"{colors['RED']}No profitable opportunities found{colors['RESET']}")
         
         elif mode == 'simulate':
             logger.info("Mode: SIMULATE")
@@ -485,7 +494,9 @@ async def main():
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
-                max_opportunities=5
+                max_opportunities=5,
+                sol_balance=sol_balance,
+                usdc_balance=usdc_balance
             )
             
             for opp in opportunities:
@@ -526,7 +537,9 @@ async def main():
                     opportunities = await trader.scan_opportunities(
                         start_token,
                         test_amount,
-                        max_opportunities=1
+                        max_opportunities=1,
+                        sol_balance=sol_balance,
+                        usdc_balance=usdc_balance
                     )
                     
                     if opportunities:
@@ -560,7 +573,7 @@ async def main():
         # Cleanup
         await jupiter.close()
         await solana.close()
-        logger.info(f"{YELLOW}Bot stopped{RESET}")
+        logger.info(f"{colors['YELLOW']}Bot stopped{colors['RESET']}")
 
 
 if __name__ == '__main__':
