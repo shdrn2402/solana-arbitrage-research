@@ -16,7 +16,7 @@ from solders.pubkey import Pubkey
 from .jupiter_client import JupiterClient
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
-from .arbitrage_finder import ArbitrageFinder
+from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
 from .trader import Trader
 from .utils import get_terminal_colors
 
@@ -26,6 +26,8 @@ colors = get_terminal_colors()
 # Logger will be initialized in main() after .env is loaded
 logger = logging.getLogger(__name__)
 
+# Suppress verbose httpx INFO logs (HTTP requests)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 def load_config() -> dict:
     """Load configuration from .env and config.json."""
@@ -106,11 +108,11 @@ async def main(mode: str = 'scan'):
         ]
     )
 
-    
+
     # Normalize mode to lowercase
     mode = mode.lower()
     
-    logger.info(f"{colors['CYAN']}Starting Solana Arbitrage Bot in the {colors['YELLOW']}{mode} mode {colors['RESET']}")
+    logger.info("Starting Solana Arbitrage Bot")
     logger.debug(f"Log level set to: {log_level_str}")
     
     # Load configuration (will reload .env, but that's fine - dotenv doesn't overwrite existing vars)
@@ -188,8 +190,8 @@ async def main(mode: str = 'scan'):
     elif max_slippage_bps_explicitly_set or slippage_bps_explicitly_set:
         # Log current configuration if at least one variable was explicitly set
         logger.info(
-            f"Slippage configuration: MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
-            f"SLIPPAGE_BPS={slippage_bps}"
+            f"{colors['CYAN']}Slippage configuration:{colors['RESET']} {colors['YELLOW']}MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
+            f"SLIPPAGE_BPS={slippage_bps}{colors['RESET']}"
         )
     
     # Load wallet
@@ -206,7 +208,7 @@ async def main(mode: str = 'scan'):
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
     if sol_price_auto and sol_price_auto > 0:
         sol_price_usdc = sol_price_auto
-        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API: {colors['YELLOW']}${sol_price_usdc:.2f} USDC{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API: {colors['YELLOW']}{sol_price_usdc:.2f} USDC{colors['RESET']}")
         # Update risk_config with fetched price
         risk_config.sol_price_usdc = sol_price_usdc
         # Recalculate max_position_absolute_usdc with updated price
@@ -373,7 +375,8 @@ async def main(mode: str = 'scan'):
         priority_fee_lamports=priority_fee,
         use_jito=use_jito,
         mode=mode,  # Pass mode for strict checking
-        slippage_bps=slippage_bps
+        slippage_bps=slippage_bps,
+        tokens_map=tokens_map
     )
     
     # DIAGNOSTIC MODE: Test if Jupiter can return routes at all
@@ -455,7 +458,7 @@ async def main(mode: str = 'scan'):
     
     try:
         if mode == 'scan':
-            logger.info("Mode: SCAN (read-only)")
+            logger.info(f"{colors['CYAN']}Mode: {colors['GREEN']}SCAN (read-only){colors['RESET']}")
             usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
             sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
             logger.info(f"Optimized scan: cycles={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
@@ -486,32 +489,42 @@ async def main(mode: str = 'scan'):
                 logger.info(f"{colors['RED']}No profitable opportunities found{colors['RESET']}")
         
         elif mode == 'simulate':
-            logger.info("Mode: SIMULATE")
+            logger.info(f"{colors['CYAN']}Mode: {colors['YELLOW']}SIMULATE{colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for simulation")
                 return
             
-            opportunities = await trader.scan_opportunities(
+            user_pubkey = str(wallet.pubkey())
+            
+            # Callback for immediate processing when opportunity is found
+            async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
+                """Process opportunity immediately with retries."""
+                cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
+                logger.info(f"{colors['GREEN']}Found opportunity: {cycle_display}{colors['RESET']}")
+                
+                success_count = await trader.process_opportunity_with_retries(
+                    opp.cycle,
+                    test_amount,
+                    user_pubkey,
+                    max_retries=10
+                )
+                
+                if success_count > 0:
+                    logger.info(f"{colors['GREEN']}Processed {success_count} successful simulations{colors['RESET']}")
+                
+                # Continue searching for more opportunities
+                return True
+            
+            # Use callback for immediate processing
+            await finder.find_opportunities(
                 start_token,
                 test_amount,
-                max_opportunities=5,
-                sol_balance=sol_balance,
-                usdc_balance=usdc_balance
+                max_opportunities=100,  # High limit, callback will process immediately
+                on_opportunity_found=on_opportunity_found
             )
-            
-            for opp in opportunities:
-                user_pubkey = str(wallet.pubkey())
-                success, error, sim_result = await trader.simulate_opportunity(opp, user_pubkey)
-                
-                if success:
-                    cycle_str = format_cycle_with_symbols(opp.cycle, tokens_map)
-                    logger.info(f"Simulation successful for cycle: {cycle_str}")
-                    logger.debug(f"Simulation result: {sim_result}")
-                else:
-                    logger.warning(f"Simulation failed: {error}")
         
         elif mode == 'live':
-            logger.info("Mode: LIVE (real trading)")
+            logger.info(f"{colors['CYAN']}Mode: {colors['RED']}LIVE (real trading){colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for live trading")
                 return
@@ -526,37 +539,51 @@ async def main(mode: str = 'scan'):
             logger.warning("Starting live mode in 3 seconds... Press Ctrl+C to cancel")
             await asyncio.sleep(3)
             
+            user_pubkey = str(wallet.pubkey())
+            
+            # Callback for immediate processing when opportunity is found
+            async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
+                """Process opportunity immediately with retries."""
+                # Don't log "Found opportunity" here - it will be logged in process_opportunity_with_retries
+                # when actual processing starts, avoiding spam for opportunities that drop on recheck
+                
+                try:
+                    success_count = await trader.process_opportunity_with_retries(
+                        opp.cycle,
+                        test_amount,
+                        user_pubkey,
+                        max_retries=10,
+                        first_attempt_use_original_opportunity=True,
+                        original_opportunity=opp
+                    )
+                    
+                    if success_count > 0:
+                        logger.info(f"{colors['GREEN']}Processed {success_count} successful executions{colors['RESET']}")
+                    # If success_count == 0, it was already logged in process_opportunity_with_retries
+                except Exception as e:
+                    logger.error(f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}", exc_info=True)
+                
+                # Continue searching for more opportunities
+                return True
+            
             # Continuous loop
             while True:
                 try:
                     # Update balance
                     balance = await solana.get_balance()
                     risk_manager.update_wallet_balance(balance)
+                    sol_balance = balance / 1e9
                     
-                    # Find opportunities
-                    opportunities = await trader.scan_opportunities(
+                    # Find opportunities with callback for immediate processing
+                    await finder.find_opportunities(
                         start_token,
                         test_amount,
-                        max_opportunities=1,
-                        sol_balance=sol_balance,
-                        usdc_balance=usdc_balance
+                        max_opportunities=100,  # High limit, callback will process immediately
+                        on_opportunity_found=on_opportunity_found
                     )
                     
-                    if opportunities:
-                        opp = opportunities[0]
-                        user_pubkey = str(wallet.pubkey())
-                        
-                        # Execute
-                        success, error, tx_sig = await trader.execute_opportunity(opp, user_pubkey)
-                        
-                        if success:
-                            logger.info(f"Successfully executed arbitrage: {tx_sig}")
-                        else:
-                            logger.warning(f"Execution failed: {error}")
-                    else:
-                        logger.info("No opportunities found, waiting...")
-                    
-                    # Wait before next iteration
+                    # Wait before next search iteration
+                    logger.info("No more opportunities in current cycle, waiting...")
                     await asyncio.sleep(5)
                     
                 except KeyboardInterrupt:

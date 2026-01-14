@@ -5,7 +5,11 @@ Enforces all trading limits and risk controls.
 import logging
 from typing import Optional, Dict, Any, Tuple
 from dataclasses import dataclass
+from .utils import get_terminal_colors
 
+# Get terminal colors (empty if output is redirected)
+colors = get_terminal_colors()
+# Logger will be initialized in main() after .env is loaded
 logger = logging.getLogger(__name__)
 
 
@@ -48,7 +52,7 @@ class RiskManager:
     def update_wallet_balance(self, balance_lamports: int):
         """Update wallet balance from network."""
         self.wallet_balance = balance_lamports
-        logger.info(f"Wallet balance updated!")
+        logger.info(f"{colors['GREEN']}Wallet balance updated!{colors['RESET']}")
     
     def get_available_balance(self) -> int:
         """Get available balance (total - locked)."""
@@ -141,7 +145,7 @@ class RiskManager:
         )
         self.active_positions[position_id] = position
         self.lock_balance(position_id, amount_in)
-        logger.info(f"Position {position_id} added: {amount_in/1e9:.4f} SOL")
+        logger.info(f"{colors['CYAN']}Position {position_id} added:{colors['RESET']} {colors['YELLOW']}{amount_in/1e9:.4f} SOL{colors['RESET']}")
     
     def update_position_status(self, position_id: str, status: str):
         """Update position status."""

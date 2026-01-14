@@ -5,9 +5,9 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
-from .jupiter_client import JupiterClient
+from .jupiter_client import JupiterClient, JupiterSwapResponse
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
@@ -30,7 +30,8 @@ class Trader:
         priority_fee_lamports: int = 0,
         use_jito: bool = False,
         mode: str = 'scan',  # 'scan', 'simulate', or 'live'
-        slippage_bps: int = 50
+        slippage_bps: int = 50,
+        tokens_map: Optional[Dict[str, str]] = None
     ):
         self.jupiter = jupiter_client
         self.solana = solana_client
@@ -41,6 +42,7 @@ class Trader:
         self.mode = mode.lower()
         self.trade_in_progress = False  # Protection against parallel trades
         self.slippage_bps = slippage_bps
+        self.tokens_map = tokens_map or {}
     
     async def scan_opportunities(
         self,
@@ -53,7 +55,8 @@ class Trader:
         """Scan for arbitrage opportunities (read-only)."""
         sol_limit = sol_balance * self.risk.config.max_position_size_percent / 100
         usdc_limit = usdc_balance * self.risk.config.max_position_size_percent / 100
-        logger.info(f"{colors['CYAN']}Scanning limits: {colors['YELLOW']}{sol_limit:.4f} SOL, {usdc_limit:.2f} USDC{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}SOL scanning limits: {colors['YELLOW']}{sol_limit:.4f} SOL{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}USDC scanning limits: {colors['YELLOW']}{usdc_limit:.2f} USDC{colors['RESET']}")
         opportunities = await self.finder.find_opportunities(
             start_token, amount, max_opportunities
         )
@@ -62,26 +65,114 @@ class Trader:
         count_color = colors['GREEN'] if count > 0 else colors['RED']
         logger.info(f"Found {count_color}{count}{colors['RESET']} opportunities")
         for i, opp in enumerate(opportunities, 1):
+            cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opp.cycle)
             logger.info(
-                f"  {i}. Cycle: {' -> '.join(opp.cycle)} | "
+                f"  {i}. Cycle: {cycle_display} | "
                 f"Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f}) | "
                 f"Impact: {opp.price_impact_total:.2f}%"
             )
         
         return opportunities
     
+    async def process_opportunity_with_retries(
+        self,
+        cycle: List[str],
+        amount: int,
+        user_pubkey: str,
+        max_retries: int = 10,
+        first_attempt_use_original_opportunity: bool = True,
+        original_opportunity: Optional[ArbitrageOpportunity] = None
+    ) -> int:
+        """
+        Process an opportunity with retries: check, simulate/execute, and repeat if successful.
+        
+        Args:
+            cycle: List of token addresses in the cycle
+            amount: Starting amount in smallest unit
+            user_pubkey: User's public key
+            max_retries: Maximum number of successful executions before stopping
+        
+        Returns:
+            Number of successful executions
+        """
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
+        logger.info(f"{colors['CYAN']}Processing opportunity with retries:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (mode: {self.mode})")
+        success_count = 0
+        timestamp_start = time.monotonic()
+        
+        while success_count < max_retries:
+            # Skip recheck on first attempt if original_opportunity is provided (zero-recheck first attempt)
+            if success_count == 0 and first_attempt_use_original_opportunity and original_opportunity is not None:
+                # Use original opportunity directly for first attempt (no recheck = faster)
+                opportunity = original_opportunity
+                logger.debug("Using original opportunity for first attempt (zero-recheck)")
+            else:
+                # Check cycle again (3 requests, no delays for fast checking) for retries
+                recheck_start = time.monotonic()
+                opportunity = await self.finder._check_cycle(cycle, amount, skip_delays=True)
+                recheck_duration_ms = (time.monotonic() - recheck_start) * 1000
+                
+                if not opportunity or not opportunity.is_valid(
+                    self.finder.min_profit_bps,
+                    self.finder.min_profit_usd
+                ):
+                    # Opportunity no longer profitable, stop retrying
+                    if success_count > 0:
+                        # Already had successful executions, opportunity just became unprofitable
+                        logger.info(f"{colors['YELLOW']}Opportunity {cycle_display} no longer profitable after {success_count} successful executions{colors['RESET']}")
+                    else:
+                        # Dropped before first execution - this is the "died before execution" case
+                        logger.info(f"{colors['RED']}Opportunity dropped before execution (recheck not profitable):{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (recheck: {recheck_duration_ms:.1f}ms)")
+                    break
+            
+            # Process based on mode
+            if self.mode == 'simulate':
+                # Simulate only
+                success, error, sim_result, swap_response = await self.simulate_opportunity(opportunity, user_pubkey)
+                if success:
+                    success_count += 1
+                    cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
+                    logger.info(f"{colors['GREEN']}Simulation #{success_count} successful for cycle: {cycle_display}{colors['RESET']}")
+                    # Continue to next retry
+                else:
+                    logger.warning(f"{colors['RED']}Simulation failed: {colors['YELLOW']}{error}{colors['RESET']}")
+                    break  # Stop retrying on failure
+            
+            elif self.mode == 'live':
+                # Execute (includes mandatory simulation)
+                success, error, tx_sig = await self.execute_opportunity(opportunity, user_pubkey)
+                if success:
+                    success_count += 1
+                    cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
+                    logger.info(f"{colors['GREEN']}Execution #{success_count} successful: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+                    # Continue to next retry
+                else:
+                    logger.warning(f"{colors['RED']}Execution failed: {colors['YELLOW']}{error}{colors['RESET']}")
+                    break  # Stop retrying on failure
+            
+            else:
+                # scan mode - shouldn't reach here
+                break
+        
+        total_duration_ms = (time.monotonic() - timestamp_start) * 1000
+        if success_count > 0:
+            logger.debug(f"Processed {success_count} executions in {total_duration_ms:.1f}ms")
+        
+        return success_count
+    
     async def simulate_opportunity(
         self,
         opportunity: ArbitrageOpportunity,
         user_pubkey: str
-    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[JupiterSwapResponse]]:
         """
         Simulate an arbitrage opportunity.
         
         Returns:
-            (success: bool, error_message: Optional[str], simulation_result: Optional[Dict])
+            (success: bool, error_message: Optional[str], simulation_result: Optional[Dict], swap_response: Optional[JupiterSwapResponse])
         """
-        logger.info(f"Simulating opportunity: {' -> '.join(opportunity.cycle)}")
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        logger.info(f"{colors['CYAN']}Simulating opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}")
         
         # Build swap transaction for the full cycle
         # Note: Jupiter doesn't support multi-leg swaps directly,
@@ -89,7 +180,7 @@ class Trader:
         # For now, we simulate the first leg as a proxy
         
         if not opportunity.quotes:
-            return False, "No quotes available", None
+            return False, "No quotes available", None, None
         
         # Get swap transaction for first leg
         first_quote = opportunity.quotes[0]
@@ -101,7 +192,7 @@ class Trader:
         )
         
         if swap_response is None:
-            return False, "Failed to build swap transaction", None
+            return False, "Failed to build swap transaction", None, None
         
         # Simulate
         sim_result = await self.solana.simulate_transaction(
@@ -109,12 +200,12 @@ class Trader:
         )
         
         if sim_result is None:
-            return False, "Simulation failed", None
+            return False, "Simulation failed", None, None
         
         if sim_result.get("err"):
-            return False, f"Simulation error: {sim_result['err']}", sim_result
+            return False, f"Simulation error: {sim_result['err']}", sim_result, swap_response
         
-        return True, None, sim_result
+        return True, None, sim_result, swap_response
     
     async def execute_opportunity(
         self,
@@ -142,8 +233,9 @@ class Trader:
         
         position_id = str(uuid.uuid4())
         
-        logger.info(f"Executing opportunity: {' -> '.join(opportunity.cycle)}")
-        logger.info(f"Position ID: {position_id}")
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        logger.info(f"{colors['CYAN']}Executing opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}Position ID:{colors['RESET']} {colors['YELLOW']}{position_id}{colors['RESET']}")
         
         # Set trade_in_progress flag BEFORE any operations
         self.trade_in_progress = True
@@ -170,12 +262,16 @@ class Trader:
             )
             
             # MANDATORY SIMULATION: No transaction can be sent without successful simulation
-            sim_success, sim_error, sim_result = await self.simulate_opportunity(
+            # Reuse swap_response from simulation to avoid duplicate Jupiter API call
+            sim_success, sim_error, sim_result, swap_response = await self.simulate_opportunity(
                 opportunity, user_pubkey
             )
             
             if not sim_success:
                 return False, f"Simulation failed (MANDATORY): {sim_error}", None
+            
+            if swap_response is None:
+                return False, "No swap transaction from simulation", None
             
             # Validate simulation result
             # Note: Simulation only executes the first leg of the cycle (see simulate_opportunity method)
@@ -195,49 +291,39 @@ class Trader:
             if not is_valid:
                 return False, f"Simulation validation failed: {reason}", None
             
-            # Build transaction
-            swap_response = await self.jupiter.get_swap_transaction(
-                first_quote,
-                user_pubkey,
-                priority_fee_lamports=self.priority_fee,
-                slippage_bps=self.slippage_bps
-            )
-            
-            if swap_response is None:
-                return False, "Failed to build swap transaction", None
-            
             # Security checks before sending transaction
             
-            # Check 1: Validate quote expiry (last_valid_block_height)
-            current_slot = await self.solana.get_current_slot()
-            if current_slot is None:
-                logger.warning("Failed to get current slot for quote expiry check, proceeding anyway")
+            # Check 1: Validate quote expiry (lastValidBlockHeight)
+            current_block_height = await self.solana.get_current_block_height()
+            if current_block_height is None:
+                logger.warning("Failed to get current block height for quote expiry check, proceeding anyway")
             else:
                 if swap_response.last_valid_block_height > 0:
-                    if current_slot >= swap_response.last_valid_block_height:
-                        error_msg = f"Quote expired: current slot {current_slot} >= last valid block height {swap_response.last_valid_block_height}"
+                    if current_block_height >= swap_response.last_valid_block_height:
+                        error_msg = (
+                            f"Quote expired: current block height {current_block_height} "
+                            f">= last valid block height {swap_response.last_valid_block_height}"
+                        )
                         logger.warning(error_msg)
                         return False, error_msg, None
                     else:
-                        logger.debug(f"Quote valid: current slot {current_slot} < last valid block height {swap_response.last_valid_block_height}")
+                        logger.debug(
+                            f"Quote valid: current block height {current_block_height} "
+                            f"< last valid block height {swap_response.last_valid_block_height}"
+                        )
                 else:
-                    logger.warning("Quote has no last_valid_block_height set (using 0), skipping expiry check")
+                    logger.warning("Quote has no last_valid_block_height set (0), skipping expiry check")
             
-            # Check 2: Re-check balance before sending transaction
-            balance = await self.solana.get_balance()
-            self.risk.update_wallet_balance(balance)
-            available_balance = self.risk.get_available_balance()
-            
-            if available_balance < opportunity.initial_amount:
-                error_msg = f"Insufficient balance: need {opportunity.initial_amount / 1e9:.4f} SOL, have {available_balance / 1e9:.4f} SOL available"
-                logger.warning(error_msg)
-                return False, error_msg, None
-            else:
-                logger.debug(f"Balance check passed: have {available_balance / 1e9:.4f} SOL available, need {opportunity.initial_amount / 1e9:.4f} SOL")
+            # Balance check is already done in can_open_position() before add_position()
+            # Removing duplicate check here to avoid false "Insufficient balance" after add_position() locks funds
             
             # Send transaction (only in 'live' mode, already checked above)
+            # Use skip_preflight=True since we already have mandatory simulation
             self.risk.update_position_status(position_id, 'executing')
-            tx_sig = await self.solana.send_transaction(swap_response.swap_transaction)
+            tx_sig = await self.solana.send_transaction(
+                swap_response.swap_transaction,
+                skip_preflight=True
+            )
             
             if tx_sig is None:
                 return False, "Failed to send transaction", None
@@ -262,5 +348,31 @@ class Trader:
         finally:
             # ALWAYS release trade_in_progress flag and clean up position
             self.trade_in_progress = False
-            await asyncio.sleep(1)
+            # Removed artificial delay - no sleep in hot path for live mode
             self.risk.remove_position(position_id)
+    
+    async def _confirm_transaction_background(
+        self,
+        position_id: str,
+        tx_sig: str
+    ) -> None:
+        """
+        Background task to confirm transaction to finalized status and update position.
+        
+        This runs asynchronously and does not block the main execution loop.
+        """
+        try:
+            # Wait for confirmed commitment (up to 30s)
+            confirmed = await self.solana.confirm_transaction(tx_sig, commitment="confirmed", timeout=30.0)
+            
+            if confirmed:
+                self.risk.update_position_status(position_id, 'completed')
+                logger.info(f"{colors['GREEN']}Transaction confirmed: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+            else:
+                self.risk.update_position_status(position_id, 'failed')
+                logger.warning(f"{colors['RED']}Transaction not confirmed: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+        except Exception as e:
+            logger.error(f"Error in background confirmation for {tx_sig}: {e}", exc_info=True)
+            # Update position status to failed on error
+            if position_id in self.risk.active_positions:
+                self.risk.update_position_status(position_id, 'failed')

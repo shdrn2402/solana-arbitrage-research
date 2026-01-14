@@ -3,14 +3,15 @@ Solana RPC client for balance checks, simulation, and transaction sending.
 """
 import asyncio
 import base58
+import base64
 import logging
 from typing import Optional, Dict, Any
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.rpc.responses import GetBalanceResp
-from solders.transaction import Transaction
+from solders.transaction import Transaction, VersionedTransaction
 from solana.rpc.async_api import AsyncClient
-from solana.rpc.commitment import Confirmed
+from solana.rpc.commitment import Confirmed, Processed
 from solana.rpc.types import TxOpts
 
 logger = logging.getLogger(__name__)
@@ -48,9 +49,10 @@ class SolanaClient:
     
     async def get_current_slot(self) -> Optional[int]:
         """
-        Get current slot/block height from Solana RPC.
+        Get current slot from Solana RPC.
         
-        This is used to check if a quote's last_valid_block_height is still valid.
+        Note: Slot is different from block height. Use get_current_block_height()
+        for comparing with Jupiter's lastValidBlockHeight.
         
         Returns:
             Current slot number (int) if successful, None if error occurred
@@ -65,6 +67,27 @@ class SolanaClient:
                 return None
         except Exception as e:
             logger.error(f"Error getting current slot: {e}")
+            return None
+    
+    async def get_current_block_height(self) -> Optional[int]:
+        """
+        Get current block height from Solana RPC.
+        
+        Used to validate Jupiter lastValidBlockHeight.
+        Block height is different from slot - use this for quote expiry checks.
+        
+        Returns:
+            Current block height (int) if successful, None if error occurred
+        """
+        try:
+            result = await self.client.get_block_height(commitment=Confirmed)
+            if result.value is not None:
+                logger.debug(f"Current block height: {result.value}")
+                return result.value
+            logger.warning("get_block_height returned None")
+            return None
+        except Exception as e:
+            logger.error(f"Error getting block height: {e}")
             return None
     
     async def simulate_transaction(
@@ -83,9 +106,16 @@ class SolanaClient:
             Simulation result dict or None
         """
         try:
-            # Decode transaction
-            tx_bytes = base58.b58decode(transaction_base64)
-            transaction = Transaction.from_bytes(tx_bytes)
+            # Decode transaction (Jupiter API returns base64, not base58)
+            # Jupiter API returns VersionedTransaction, not legacy Transaction
+            tx_bytes = base64.b64decode(transaction_base64)
+            
+            # Try VersionedTransaction first (Jupiter API format)
+            try:
+                transaction = VersionedTransaction.from_bytes(tx_bytes)
+            except Exception:
+                # Fallback to legacy Transaction if VersionedTransaction fails
+                transaction = Transaction.from_bytes(tx_bytes)
             
             # Simulate
             result = await self.client.simulate_transaction(
@@ -119,7 +149,7 @@ class SolanaClient:
         Send a transaction.
         
         Args:
-            transaction_base64: Base64-encoded transaction
+            transaction_base64: Base64-encoded transaction (Jupiter API format)
             skip_preflight: Skip preflight checks
             max_retries: Maximum retry attempts
         
@@ -127,13 +157,25 @@ class SolanaClient:
             Transaction signature (base58) or None
         """
         try:
-            # Decode transaction
-            tx_bytes = base58.b58decode(transaction_base64)
-            transaction = Transaction.from_bytes(tx_bytes)
+            # Decode transaction (Jupiter API returns base64, not base58)
+            # Jupiter API returns VersionedTransaction, not legacy Transaction
+            tx_bytes = base64.b64decode(transaction_base64)
+            
+            # Try VersionedTransaction first (Jupiter API format)
+            try:
+                transaction = VersionedTransaction.from_bytes(tx_bytes)
+            except Exception:
+                # Fallback to legacy Transaction if VersionedTransaction fails
+                transaction = Transaction.from_bytes(tx_bytes)
             
             # Sign if wallet is available
             if self.wallet:
-                transaction.sign(self.wallet)
+                if isinstance(transaction, VersionedTransaction):
+                    # VersionedTransaction signing
+                    transaction.sign([self.wallet])
+                else:
+                    # Legacy Transaction signing
+                    transaction.sign(self.wallet)
             
             # Send with retries
             for attempt in range(max_retries):
@@ -163,6 +205,32 @@ class SolanaClient:
         except Exception as e:
             logger.error(f"Error sending transaction: {e}")
             return None
+    
+    async def confirm_transaction_processed(
+        self,
+        signature: str,
+        timeout: float = 2.0
+    ) -> bool:
+        """
+        Wait for transaction confirmation at 'processed' commitment level (fast, non-final).
+        
+        Args:
+            signature: Transaction signature
+            timeout: Timeout in seconds (short, default 2.0)
+        
+        Returns:
+            True if processed, False otherwise
+        """
+        try:
+            result = await self.client.confirm_transaction(
+                signature,
+                commitment="processed",
+                timeout=timeout
+            )
+            return result.value[0].confirmation_status is not None
+        except Exception as e:
+            logger.debug(f"Transaction not processed within {timeout}s: {e}")
+            return False
     
     async def confirm_transaction(
         self,

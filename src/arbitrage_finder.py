@@ -4,7 +4,7 @@ Searches for cycles starting and ending in USDC (3-leg and 4-leg formats) with p
 """
 import asyncio
 import logging
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable, Awaitable
 from dataclasses import dataclass
 import time
 
@@ -76,7 +76,8 @@ class ArbitrageFinder:
         self,
         start_token: str,
         amount: int,
-        max_opportunities: int = 10
+        max_opportunities: int = 10,
+        on_opportunity_found: Optional[Callable[[ArbitrageOpportunity], Awaitable[bool]]] = None
     ) -> List[ArbitrageOpportunity]:
         """
         Find arbitrage opportunities starting from a token.
@@ -99,6 +100,10 @@ class ArbitrageFinder:
             return []
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
+        if on_opportunity_found:
+            logger.debug("Callback on_opportunity_found is provided, will call it for each profitable opportunity")
+        else:
+            logger.debug("No callback provided, will collect all opportunities")
         
         # Check each cycle sequentially (no parallelism) with delays to avoid quota burn
         for cycle in cycles:
@@ -106,8 +111,26 @@ class ArbitrageFinder:
             
             if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
                 opportunities.append(result)
+                
+                # If callback provided, call it immediately (processing will pause the search loop)
+                if on_opportunity_found:
+                    logger.info("Calling on_opportunity_found callback...")
+                    try:
+                        should_continue = await on_opportunity_found(result)
+                        logger.info(f"Callback finished, should_continue={should_continue}")
+                    except Exception as e:
+                        logger.error(f"Error in on_opportunity_found callback: {e}", exc_info=True)
+                        should_continue = True  # Continue on error to avoid blocking
+                    
+                    if not should_continue:
+                        # Callback requested to stop searching
+                        logger.info("Callback requested to stop searching")
+                        break
+                    # Skip delay if callback was called (processing already paused the loop)
+                    continue
             
             # Delay between cycles for rate limiting (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
+            # Skip delay if callback was called (already continued above)
             await asyncio.sleep(self.quote_delay_seconds)
         
         # Sort by profit (descending)
@@ -166,7 +189,8 @@ class ArbitrageFinder:
     async def _check_cycle(
         self,
         cycle: List[str],
-        initial_amount: int
+        initial_amount: int,
+        skip_delays: bool = False
     ) -> Optional[ArbitrageOpportunity]:
         """
         Check if a cycle is profitable.
@@ -202,7 +226,8 @@ class ArbitrageFinder:
                 current_amount = quote.out_amount
                 
                 # Delay between quote requests within a cycle (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
-                if i < len(cycle) - 2:  # Don't delay after last leg
+                # Skip delays for fast retry checks
+                if not skip_delays and i < len(cycle) - 2:  # Don't delay after last leg
                     await asyncio.sleep(self.quote_delay_seconds)
             
             # Calculate profit
