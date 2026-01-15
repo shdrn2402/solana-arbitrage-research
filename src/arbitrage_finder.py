@@ -1,10 +1,10 @@
 """
 Arbitrage opportunity finder.
-Searches for A -> B -> C -> A cycles (3-leg cycles) with profit.
+Searches for cycles starting and ending in USDC (3-leg and 4-leg formats) with profit.
 """
 import asyncio
 import logging
-from typing import List, Dict, Optional, Tuple, AsyncIterator
+from typing import List, Dict, Optional, Tuple, Callable, Awaitable
 from dataclasses import dataclass
 import time
 
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ArbitrageOpportunity:
     """Represents an arbitrage opportunity."""
-    cycle: List[str]  # [token1, token2, token3, token1] - 3-leg cycle with 4 elements
+    cycle: List[str]  # [USDC, X, Y, USDC] or [USDC, X, Y, Z, USDC] - 3-leg or 4-leg cycle starting and ending in USDC
     quotes: List[JupiterQuote]
     initial_amount: int
     final_amount: int
@@ -59,17 +59,9 @@ class ArbitrageFinder:
         quote_timeout: float = 5.0,
         slippage_bps: int = 50,
         sol_price_usdc: float = 100.0,
-        quote_delay_seconds: float = 1.0
+        quote_delay_seconds: float = 1.0,
+        cycles: List[List[str]] = None
     ):
-        """
-        Initialize arbitrage finder.
-        
-        Args:
-            jupiter_client: Jupiter API client
-            tokens: List of token mint addresses
-            cycles: List of cycles in symbol format (from config.json)
-            tokens_config: Dictionary mapping token symbols to addresses
-        """
         self.jupiter = jupiter_client
         self.tokens = tokens
         self.cycles_symbols = cycles  # Cycles in symbol format
@@ -82,39 +74,14 @@ class ArbitrageFinder:
         self.slippage_bps = slippage_bps
         self.sol_price_usdc = sol_price_usdc
         self.quote_delay_seconds = quote_delay_seconds
-        
-        # Convert cycles from symbols to addresses
-        self.cycles_addresses = self.convert_cycles_to_addresses(cycles, tokens_config)
-    
-    def convert_cycles_to_addresses(self, cycles_symbols: List[List[str]], tokens_config: Dict[str, str]) -> List[List[str]]:
-        """
-        Convert cycles from symbols to addresses.
-        
-        Args:
-            cycles_symbols: Cycles in symbol format [["USDC", "SOL", "JUP", "USDC"], ...]
-            tokens_config: Dictionary mapping symbol -> address
-        
-        Returns:
-            Cycles in address format [["address1", "address2", ...], ...]
-        
-        Raises:
-            ValueError: If any token symbol is not found in tokens_config
-        """
-        cycles_addresses = []
-        for cycle_symbols in cycles_symbols:
-            cycle_addresses = []
-            for symbol in cycle_symbols:
-                if symbol not in tokens_config:
-                    raise ValueError(f"Token {symbol} not found in config.tokens")
-                cycle_addresses.append(tokens_config[symbol])
-            cycles_addresses.append(cycle_addresses)
-        return cycles_addresses
+        self.cycles = cycles or []  # Load cycles from config.json
     
     async def find_opportunities(
         self,
         start_token: str,
         amount: int,
-        max_opportunities: int = 10
+        max_opportunities: int = 10,
+        on_opportunity_found: Optional[Callable[[ArbitrageOpportunity], Awaitable[bool]]] = None
     ) -> List[ArbitrageOpportunity]:
         """
         Find arbitrage opportunities starting from a token.
@@ -129,20 +96,86 @@ class ArbitrageFinder:
         """
         opportunities = []
         
-        # Use cycles from config (already converted to addresses in init)
-        cycles = self.cycles_addresses
+        # Use cycles from config.json (loaded via constructor)
+        cycles = self.cycles
+        
+        if not cycles:
+            logger.warning("No cycles configured. Please add cycles to config.json")
+            return []
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
+        if on_opportunity_found:
+            logger.debug("Callback on_opportunity_found is provided, will call it for each profitable opportunity")
+        else:
+            logger.debug("No callback provided, will collect all opportunities")
         
         # Check each cycle sequentially (no parallelism) with delays to avoid quota burn
         for cycle in cycles:
             result = await self._check_cycle(cycle, amount)
             
-            if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
-                opportunities.append(result)
+            if result:
+                # Check validity and log rejection reasons at DEBUG level
+                is_valid = result.is_valid(self.min_profit_bps, self.min_profit_usd)
+                
+                if not is_valid:
+                    # Log why opportunity was rejected (DEBUG level to avoid noise)
+                    rejection_reasons = []
+                    if result.profit_usd < self.min_profit_usd:
+                        rejection_reasons.append(
+                            f"profit_usd={result.profit_usd:.4f} < min_profit_usd={self.min_profit_usd:.4f}"
+                        )
+                    if self.min_profit_bps > 0 and result.profit_bps < self.min_profit_bps:
+                        rejection_reasons.append(
+                            f"profit_bps={result.profit_bps} < min_profit_bps={self.min_profit_bps}"
+                        )
+                    
+                    logger.debug(
+                        f"Opportunity rejected: {'; '.join(rejection_reasons)} "
+                        f"(cycle: {' -> '.join(result.cycle[:3])}...)"
+                    )
+                else:
+                    # Safety assertion: ensure opportunity meets minimum requirements
+                    if result.profit_usd < self.min_profit_usd:
+                        logger.error(
+                            f"CRITICAL: Opportunity passed is_valid() but profit_usd={result.profit_usd:.4f} < "
+                            f"min_profit_usd={self.min_profit_usd:.4f}. Skipping to prevent invalid results."
+                        )
+                        continue  # Skip this opportunity
+                    
+                    if self.min_profit_bps > 0 and result.profit_bps < self.min_profit_bps:
+                        logger.error(
+                            f"CRITICAL: Opportunity passed is_valid() but profit_bps={result.profit_bps} < "
+                            f"min_profit_bps={self.min_profit_bps}. Skipping to prevent invalid results."
+                        )
+                        continue  # Skip this opportunity
+                    
+                    # All checks passed - safe to append
+                    opportunities.append(result)
+                
+                # If callback provided, call it immediately (processing will pause the search loop)
+                if on_opportunity_found:
+                    logger.info("Calling on_opportunity_found callback...")
+                    try:
+                        should_continue = await on_opportunity_found(result)
+                        logger.info(f"Callback finished, should_continue={should_continue}")
+                    except Exception as e:
+                        logger.error(f"Error in on_opportunity_found callback: {e}", exc_info=True)
+                        should_continue = True  # Continue on error to avoid blocking
+                    
+                    if not should_continue:
+                        # Callback requested to stop searching
+                        logger.info("Callback requested to stop searching")
+                        break
+                    # Apply delay after callback (rate limiting per cycle)
+                    # Delay is proportional to number of quote requests in the cycle
+                    quotes_per_cycle = len(cycle) - 1
+                    await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
+                    continue
             
-            # Delay between cycles for rate limiting (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
-            await asyncio.sleep(self.quote_delay_seconds)
+            # Delay between cycles for rate limiting (proportional to number of quote requests)
+            # This maintains ~60 req/min average while allowing burst quotes within a cycle
+            quotes_per_cycle = len(cycle) - 1
+            await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.profit_bps, reverse=True)
@@ -192,13 +225,14 @@ class ArbitrageFinder:
     async def _check_cycle(
         self,
         cycle: List[str],
-        initial_amount: int
+        initial_amount: int,
+        skip_delays: bool = False
     ) -> Optional[ArbitrageOpportunity]:
         """
         Check if a cycle is profitable.
         
         Args:
-            cycle: List of token mints [A, B, C, A] (3-leg cycle, 4 elements total)
+            cycle: List of token mints [USDC, X, Y, USDC] or [USDC, X, Y, Z, USDC] (3-leg or 4-leg cycle, all starting and ending in USDC)
             initial_amount: Starting amount in smallest unit
         
         Returns:
@@ -227,9 +261,8 @@ class ArbitrageFinder:
                 quotes.append(quote)
                 current_amount = quote.out_amount
                 
-                # Delay between quote requests within a cycle (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
-                if i < len(cycle) - 2:  # Don't delay after last leg
-                    await asyncio.sleep(self.quote_delay_seconds)
+                # NO delays between legs within a cycle - take quotes in burst for consistency
+                # Rate limiting is handled by delay AFTER the cycle (proportional to number of requests)
             
             # Calculate profit
             final_amount = current_amount

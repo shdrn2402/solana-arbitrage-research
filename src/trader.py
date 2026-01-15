@@ -3,43 +3,20 @@ Main trading module that orchestrates arbitrage execution.
 """
 import asyncio
 import logging
-import sys
 import time
 import uuid
-from typing import Optional, Dict, Any, Tuple, List, AsyncIterator
+from typing import Optional, Dict, Any, Tuple, List
 
-from .jupiter_client import JupiterClient
+from .jupiter_client import JupiterClient, JupiterSwapResponse
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
+from .utils import get_terminal_colors
+
+# Get terminal colors (empty if output is redirected)
+colors = get_terminal_colors()
 
 logger = logging.getLogger(__name__)
-
-
-def _get_colors() -> Dict[str, str]:
-    """
-    Get ANSI color codes if output is to TTY, otherwise return empty strings.
-    
-    Returns:
-        Dictionary with color codes: GREEN, CYAN, YELLOW, BOLD, RESET
-    """
-    if sys.stdout.isatty():
-        return {
-            'GREEN': '\033[92m',
-            'CYAN': '\033[96m',
-            'YELLOW': '\033[93m',
-            'BOLD': '\033[1m',
-            'RESET': '\033[0m'
-        }
-    else:
-        return {
-            'GREEN': '',
-            'CYAN': '',
-            'YELLOW': '',
-            'BOLD': '',
-            'RESET': ''
-        }
-
 
 class Trader:
     """Main trading orchestrator."""
@@ -54,7 +31,7 @@ class Trader:
         use_jito: bool = False,
         mode: str = 'scan',  # 'scan', 'simulate', or 'live'
         slippage_bps: int = 50,
-        address_to_symbol: Optional[Dict[str, str]] = None
+        tokens_map: Optional[Dict[str, str]] = None
     ):
         self.jupiter = jupiter_client
         self.solana = solana_client
@@ -65,96 +42,204 @@ class Trader:
         self.mode = mode.lower()
         self.trade_in_progress = False  # Protection against parallel trades
         self.slippage_bps = slippage_bps
-        self.address_to_symbol = address_to_symbol or {}  # Dictionary mapping address -> symbol
-    
-    def format_cycle_with_symbols(self, cycle_addresses: List[str]) -> str:
-        """
-        Convert cycle from addresses to string with token symbols.
-        
-        Args:
-            cycle_addresses: List of token addresses [address1, address2, address3, address1]
-        
-        Returns:
-            String in format "BONK -> SOL -> USDC -> BONK"
-            If address is not found in dictionary, shows first 8 characters + "..."
-        """
-        symbols = []
-        for address in cycle_addresses:
-            # Use reverse dictionary address -> symbol
-            symbol = self.address_to_symbol.get(address)
-            if symbol is None:
-                # Fallback: show first 8 characters of address
-                symbol = address[:8] + "..."
-            symbols.append(symbol)
-        return " -> ".join(symbols)
+        self.tokens_map = tokens_map or {}
     
     async def scan_opportunities(
         self,
         start_token: str,
         amount: int,
-        max_opportunities: int = 10
+        max_opportunities: int = 10,
+        sol_balance: float = 0.0,
+        usdc_balance: float = 0.0
     ) -> list[ArbitrageOpportunity]:
         """Scan for arbitrage opportunities (read-only)."""
-        logger.info(f"Scanning for opportunities: {amount/1e9:.4f} SOL")
+        sol_limit = sol_balance * self.risk.config.max_position_size_percent / 100
+        usdc_limit = usdc_balance * self.risk.config.max_position_size_percent / 100
+        logger.info(f"{colors['CYAN']}SOL scanning limits: {colors['YELLOW']}{sol_limit:.4f} SOL{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}USDC scanning limits: {colors['YELLOW']}{usdc_limit:.2f} USDC{colors['RESET']}")
         opportunities = await self.finder.find_opportunities(
             start_token, amount, max_opportunities
         )
         
-        colors = _get_colors()
-        logger.info(f"{colors['BOLD']}{colors['GREEN']}Found {len(opportunities)} opportunities{colors['RESET']}")
+        count = len(opportunities)
+        count_color = colors['GREEN'] if count > 0 else colors['RED']
+        logger.info(f"Found {count_color}{count}{colors['RESET']} opportunities")
         for i, opp in enumerate(opportunities, 1):
+            cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opp.cycle)
             logger.info(
-                f"  {colors['YELLOW']}{i}.{colors['RESET']} "
-                f"Cycle: {colors['CYAN']}{self.format_cycle_with_symbols(opp.cycle)}{colors['RESET']} | "
-                f"Profit: {colors['GREEN']}{opp.profit_bps} bps (${opp.profit_usd:.4f}){colors['RESET']} | "
+                f"  {i}. Cycle: {cycle_display} | "
+                f"Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f}) | "
                 f"Impact: {opp.price_impact_total:.2f}%"
             )
         
         return opportunities
     
-    async def scan_opportunities_stream(
+    async def process_opportunity_with_retries(
         self,
-        start_token: str,
+        cycle: List[str],
         amount: int,
-        max_opportunities: int = 10
-    ) -> AsyncIterator[ArbitrageOpportunity]:
+        user_pubkey: str,
+        max_retries: int = 10,
+        first_attempt_use_original_opportunity: bool = True,
+        original_opportunity: Optional[ArbitrageOpportunity] = None
+    ) -> int:
         """
-        Scan for opportunities and yield them as they are found.
-        
-        This method uses async generator to yield opportunities immediately
-        as they are found, allowing stream processing without waiting
-        for all cycles to complete.
+        Process an opportunity with retries: check, simulate/execute, and repeat if successful.
         
         Args:
-            start_token: Starting token mint address
+            cycle: List of token addresses in the cycle
             amount: Starting amount in smallest unit
-            max_opportunities: Maximum number of opportunities to yield
+            user_pubkey: User's public key
+            max_retries: Maximum number of successful executions before stopping
         
-        Yields:
-            ArbitrageOpportunity as they are found
+        Returns:
+            Number of successful executions
         """
-        logger.info(f"Scanning for opportunities (stream mode): {amount/1e9:.4f} SOL")
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
+        logger.info(f"{colors['CYAN']}Processing opportunity with retries:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (mode: {self.mode})")
+        success_count = 0
+        timestamp_start = time.monotonic()
         
-        async for opportunity in self.finder.find_opportunities_stream(start_token, amount, max_opportunities):
-            logger.info(
-                f"Found opportunity: Cycle: {self.format_cycle_with_symbols(opportunity.cycle)} | "
-                f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
-                f"Impact: {opportunity.price_impact_total:.2f}%"
-            )
-            yield opportunity
+        while success_count < max_retries:
+            # Skip recheck on first attempt if original_opportunity is provided (zero-recheck first attempt)
+            if success_count == 0 and first_attempt_use_original_opportunity and original_opportunity is not None:
+                # Use original opportunity directly for first attempt (no recheck = faster)
+                opportunity = original_opportunity
+                logger.debug("Using original opportunity for first attempt (zero-recheck)")
+            else:
+                # Check cycle again (3 requests, no delays for fast checking) for retries
+                recheck_start = time.monotonic()
+                opportunity = await self.finder._check_cycle(cycle, amount, skip_delays=True)
+                recheck_duration_ms = (time.monotonic() - recheck_start) * 1000
+                
+                if not opportunity or not opportunity.is_valid(
+                    self.finder.min_profit_bps,
+                    self.finder.min_profit_usd
+                ):
+                    # Opportunity no longer profitable, stop retrying
+                    if success_count > 0:
+                        # Already had successful executions, opportunity just became unprofitable
+                        logger.info(f"{colors['YELLOW']}Opportunity {cycle_display} no longer profitable after {success_count} successful executions{colors['RESET']}")
+                    else:
+                        # Dropped before first execution - this is the "died before execution" case
+                        logger.info(f"{colors['RED']}Opportunity dropped before execution (recheck not profitable):{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (recheck: {recheck_duration_ms:.1f}ms)")
+                    break
+            
+            # Process based on mode
+            if self.mode == 'simulate':
+                # Simulate only
+                success, error, sim_result, swap_response = await self.simulate_opportunity(opportunity, user_pubkey)
+                if success:
+                    success_count += 1
+                    cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
+                    
+                    # Format initial/final amounts based on starting token
+                    start_token = opportunity.cycle[0]
+                    initial_display = self._format_amount(opportunity.initial_amount, start_token)
+                    final_display = self._format_amount(opportunity.final_amount, start_token)
+                    
+                    logger.info(
+                        f"{colors['GREEN']}Simulation #{success_count} successful for cycle: {cycle_display} | "
+                        f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
+                        f"Initial: {initial_display} | "
+                        f"Final: {final_display}{colors['RESET']}"
+                    )
+                    # Continue to next retry
+                else:
+                    logger.warning(f"{colors['RED']}Simulation failed: {colors['YELLOW']}{error}{colors['RESET']}")
+                    break  # Stop retrying on failure
+            
+            elif self.mode == 'live':
+                # Execute (includes mandatory simulation)
+                success, error, tx_sig = await self.execute_opportunity(opportunity, user_pubkey)
+                if success:
+                    success_count += 1
+                    cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
+                    
+                    # Format initial/final amounts based on starting token
+                    start_token = opportunity.cycle[0]
+                    initial_display = self._format_amount(opportunity.initial_amount, start_token)
+                    final_display = self._format_amount(opportunity.final_amount, start_token)
+                    
+                    logger.info(
+                        f"{colors['GREEN']}Execution #{success_count} successful: {colors['CYAN']}{tx_sig}{colors['RESET']} | "
+                        f"Cycle: {cycle_display} | "
+                        f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
+                        f"Initial: {initial_display} | "
+                        f"Final: {final_display}"
+                    )
+                    # Continue to next retry
+                else:
+                    logger.warning(f"{colors['RED']}Execution failed: {error}{colors['RESET']}")
+                    break  # Stop retrying on failure
+            
+            else:
+                # scan mode - shouldn't reach here
+                break
+        
+        total_duration_ms = (time.monotonic() - timestamp_start) * 1000
+        if success_count > 0:
+            logger.debug(f"Processed {success_count} executions in {total_duration_ms:.1f}ms")
+        
+        return success_count
+    
+    def _format_amount(self, amount: int, token_mint: str) -> str:
+        """
+        Format amount based on token type (SOL, USDC, or unknown).
+        
+        Args:
+            amount: Amount in smallest units
+            token_mint: Token mint address
+        
+        Returns:
+            Formatted string with amount and token symbol
+        """
+        sol_mint = "So11111111111111111111111111111111111111112"
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        
+        if token_mint == sol_mint:
+            return f"{amount/1e9:.6f} SOL"
+        elif token_mint == usdc_mint:
+            return f"{amount/1e6:.2f} USDC"
+        else:
+            # Unknown token, show raw amount
+            return f"{amount}"
+    
+    def _format_sim_logs(self, logs: list, tail: int = 20) -> str:
+        """
+        Format simulation logs, showing only last N lines to avoid spam.
+        
+        Args:
+            logs: List of log strings from simulation
+            tail: Number of last lines to show
+        
+        Returns:
+            Formatted string with log lines
+        """
+        if not logs:
+            return "  (no logs)"
+        
+        # Show full logs in DEBUG, tail in INFO/WARNING
+        if logger.isEnabledFor(logging.DEBUG):
+            lines_to_show = logs
+        else:
+            lines_to_show = logs[-tail:] if len(logs) > tail else logs
+        
+        return "\n".join(f"  {log}" for log in lines_to_show)
     
     async def simulate_opportunity(
         self,
         opportunity: ArbitrageOpportunity,
         user_pubkey: str
-    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    ) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]], Optional[JupiterSwapResponse]]:
         """
         Simulate an arbitrage opportunity.
         
         Returns:
-            (success: bool, error_message: Optional[str], simulation_result: Optional[Dict])
+            (success: bool, error_message: Optional[str], simulation_result: Optional[Dict], swap_response: Optional[JupiterSwapResponse])
         """
-        logger.info(f"Simulating opportunity: {self.format_cycle_with_symbols(opportunity.cycle)}")
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        logger.info(f"{colors['CYAN']}Simulating opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}")
         
         # Build swap transaction for the full cycle
         # Note: Jupiter doesn't support multi-leg swaps directly,
@@ -162,7 +247,7 @@ class Trader:
         # For now, we simulate the first leg as a proxy
         
         if not opportunity.quotes:
-            return False, "No quotes available", None
+            return False, "No quotes available", None, None
         
         # Get swap transaction for first leg
         first_quote = opportunity.quotes[0]
@@ -174,7 +259,7 @@ class Trader:
         )
         
         if swap_response is None:
-            return False, "Failed to build swap transaction", None
+            return False, "Failed to build swap transaction", None, None
         
         # Simulate
         sim_result = await self.solana.simulate_transaction(
@@ -182,12 +267,18 @@ class Trader:
         )
         
         if sim_result is None:
-            return False, "Simulation failed", None
+            return False, "Simulation failed (no result from RPC)", None, None
         
         if sim_result.get("err"):
-            return False, f"Simulation error: {sim_result['err']}", sim_result
+            # Include simulation logs in error message for debugging
+            err_msg = f"Simulation error: {sim_result['err']}"
+            logs = sim_result.get("logs", [])
+            if logs:
+                log_tail = self._format_sim_logs(logs, tail=20)
+                err_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+            return False, err_msg, sim_result, swap_response
         
-        return True, None, sim_result
+        return True, None, sim_result, swap_response
     
     async def execute_opportunity(
         self,
@@ -215,8 +306,9 @@ class Trader:
         
         position_id = str(uuid.uuid4())
         
-        logger.info(f"Executing opportunity: {self.format_cycle_with_symbols(opportunity.cycle)}")
-        logger.info(f"Position ID: {position_id}")
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        logger.info(f"{colors['CYAN']}Executing opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}Position ID:{colors['RESET']} {colors['YELLOW']}{position_id}{colors['RESET']}")
         
         # Set trade_in_progress flag BEFORE any operations
         self.trade_in_progress = True
@@ -243,12 +335,22 @@ class Trader:
             )
             
             # MANDATORY SIMULATION: No transaction can be sent without successful simulation
-            sim_success, sim_error, sim_result = await self.simulate_opportunity(
+            # Reuse swap_response from simulation to avoid duplicate Jupiter API call
+            sim_success, sim_error, sim_result, swap_response = await self.simulate_opportunity(
                 opportunity, user_pubkey
             )
             
             if not sim_success:
-                return False, f"Simulation failed (MANDATORY): {sim_error}", None
+                # sim_error already includes logs if available
+                error_msg = f"Simulation failed (MANDATORY): {sim_error}"
+                # If sim_result has logs but they weren't included in sim_error, add them
+                if sim_result and sim_result.get("logs") and "Simulation logs" not in sim_error:
+                    log_tail = self._format_sim_logs(sim_result.get("logs", []), tail=20)
+                    error_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+                return False, error_msg, None
+            
+            if swap_response is None:
+                return False, "No swap transaction from simulation", None
             
             # Validate simulation result
             # Note: Simulation only executes the first leg of the cycle (see simulate_opportunity method)
@@ -268,49 +370,39 @@ class Trader:
             if not is_valid:
                 return False, f"Simulation validation failed: {reason}", None
             
-            # Build transaction
-            swap_response = await self.jupiter.get_swap_transaction(
-                first_quote,
-                user_pubkey,
-                priority_fee_lamports=self.priority_fee,
-                slippage_bps=self.slippage_bps
-            )
-            
-            if swap_response is None:
-                return False, "Failed to build swap transaction", None
-            
             # Security checks before sending transaction
             
-            # Check 1: Validate quote expiry (last_valid_block_height)
-            current_slot = await self.solana.get_current_slot()
-            if current_slot is None:
-                logger.warning("Failed to get current slot for quote expiry check, proceeding anyway")
+            # Check 1: Validate quote expiry (lastValidBlockHeight)
+            current_block_height = await self.solana.get_current_block_height()
+            if current_block_height is None:
+                logger.warning("Failed to get current block height for quote expiry check, proceeding anyway")
             else:
                 if swap_response.last_valid_block_height > 0:
-                    if current_slot >= swap_response.last_valid_block_height:
-                        error_msg = f"Quote expired: current slot {current_slot} >= last valid block height {swap_response.last_valid_block_height}"
+                    if current_block_height >= swap_response.last_valid_block_height:
+                        error_msg = (
+                            f"Quote expired: current block height {current_block_height} "
+                            f">= last valid block height {swap_response.last_valid_block_height}"
+                        )
                         logger.warning(error_msg)
                         return False, error_msg, None
                     else:
-                        logger.debug(f"Quote valid: current slot {current_slot} < last valid block height {swap_response.last_valid_block_height}")
+                        logger.debug(
+                            f"Quote valid: current block height {current_block_height} "
+                            f"< last valid block height {swap_response.last_valid_block_height}"
+                        )
                 else:
-                    logger.warning("Quote has no last_valid_block_height set (using 0), skipping expiry check")
+                    logger.warning("Quote has no last_valid_block_height set (0), skipping expiry check")
             
-            # Check 2: Re-check balance before sending transaction
-            balance = await self.solana.get_balance()
-            self.risk.update_wallet_balance(balance)
-            available_balance = self.risk.get_available_balance()
-            
-            if available_balance < opportunity.initial_amount:
-                error_msg = f"Insufficient balance: need {opportunity.initial_amount / 1e9:.4f} SOL, have {available_balance / 1e9:.4f} SOL available"
-                logger.warning(error_msg)
-                return False, error_msg, None
-            else:
-                logger.debug(f"Balance check passed: have {available_balance / 1e9:.4f} SOL available, need {opportunity.initial_amount / 1e9:.4f} SOL")
+            # Balance check is already done in can_open_position() before add_position()
+            # Removing duplicate check here to avoid false "Insufficient balance" after add_position() locks funds
             
             # Send transaction (only in 'live' mode, already checked above)
+            # Use skip_preflight=True since we already have mandatory simulation
             self.risk.update_position_status(position_id, 'executing')
-            tx_sig = await self.solana.send_transaction(swap_response.swap_transaction)
+            tx_sig = await self.solana.send_transaction(
+                swap_response.swap_transaction,
+                skip_preflight=True
+            )
             
             if tx_sig is None:
                 return False, "Failed to send transaction", None
@@ -335,5 +427,31 @@ class Trader:
         finally:
             # ALWAYS release trade_in_progress flag and clean up position
             self.trade_in_progress = False
-            await asyncio.sleep(1)
+            # Removed artificial delay - no sleep in hot path for live mode
             self.risk.remove_position(position_id)
+    
+    async def _confirm_transaction_background(
+        self,
+        position_id: str,
+        tx_sig: str
+    ) -> None:
+        """
+        Background task to confirm transaction to finalized status and update position.
+        
+        This runs asynchronously and does not block the main execution loop.
+        """
+        try:
+            # Wait for confirmed commitment (up to 30s)
+            confirmed = await self.solana.confirm_transaction(tx_sig, commitment="confirmed", timeout=30.0)
+            
+            if confirmed:
+                self.risk.update_position_status(position_id, 'completed')
+                logger.info(f"{colors['GREEN']}Transaction confirmed: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+            else:
+                self.risk.update_position_status(position_id, 'failed')
+                logger.warning(f"{colors['RED']}Transaction not confirmed: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+        except Exception as e:
+            logger.error(f"Error in background confirmation for {tx_sig}: {e}", exc_info=True)
+            # Update position status to failed on error
+            if position_id in self.risk.active_positions:
+                self.risk.update_position_status(position_id, 'failed')

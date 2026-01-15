@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 
 import dotenv
 from solders.keypair import Keypair
@@ -16,39 +16,18 @@ from solders.pubkey import Pubkey
 from .jupiter_client import JupiterClient
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
-from .arbitrage_finder import ArbitrageFinder
+from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
 from .trader import Trader
+from .utils import get_terminal_colors
+
+# Get terminal colors (empty if output is redirected)
+colors = get_terminal_colors()
 
 # Logger will be initialized in main() after .env is loaded
 logger = logging.getLogger(__name__)
-# Suppress httpx HTTP request logs (too verbose)
+
+# Suppress verbose httpx INFO logs (HTTP requests)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-
-def _get_colors() -> Dict[str, str]:
-    """
-    Get ANSI color codes if output is to TTY, otherwise return empty strings.
-    
-    Returns:
-        Dictionary with color codes: GREEN, CYAN, YELLOW, BOLD, RESET
-    """
-    if sys.stdout.isatty():
-        return {
-            'GREEN': '\033[92m',
-            'CYAN': '\033[96m',
-            'YELLOW': '\033[93m',
-            'BOLD': '\033[1m',
-            'RESET': '\033[0m'
-        }
-    else:
-        return {
-            'GREEN': '',
-            'CYAN': '',
-            'YELLOW': '',
-            'BOLD': '',
-            'RESET': ''
-        }
-
 
 def load_config() -> dict:
     """Load configuration from .env and config.json."""
@@ -71,6 +50,15 @@ def load_config() -> dict:
     return config
 
 
+def format_cycle_with_symbols(cycle: list[str], tokens_map: dict) -> str:
+    """Convert cycle addresses to token symbols."""
+    symbols = []
+    for addr in cycle:
+        symbol = tokens_map.get(addr, addr)  # Use symbol if found, otherwise use address
+        symbols.append(symbol)
+    return ' -> '.join(symbols)
+
+
 def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
     """Load wallet from private key."""
     if not private_key_str:
@@ -90,8 +78,13 @@ def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
         return None
 
 
-async def main():
-    """Main function."""
+async def main(mode: str = 'scan'):
+    """
+    Main function.
+    
+    Args:
+        mode: Operation mode - 'scan' (default), 'simulate', or 'live'
+    """
     # Load .env FIRST to read LOG_LEVEL before setting up logging
     env_path = Path(__file__).parent.parent / '.env'
     if env_path.exists():
@@ -114,6 +107,10 @@ async def main():
             logging.FileHandler('arbitrage_bot.log')
         ]
     )
+
+
+    # Normalize mode to lowercase
+    mode = mode.lower()
     
     logger.info("Starting Solana Arbitrage Bot")
     logger.debug(f"Log level set to: {log_level_str}")
@@ -127,7 +124,6 @@ async def main():
     # If set explicitly, that URL will be used (no fallback)
     jupiter_api_url = os.getenv('JUPITER_API_URL')  # None = use fallback
     jupiter_api_key = os.getenv('JUPITER_API_KEY')  # Optional API key for authenticated requests
-    mode = os.getenv('MODE', 'scan').lower()
     
     # Risk config - all limits in USDC for consistency
     sol_price_usdc = float(os.getenv('SOL_PRICE_USDC', '100.0'))  # Default SOL price
@@ -155,6 +151,7 @@ async def main():
         max_active_positions=int(os.getenv('MAX_ACTIVE_POSITIONS', '1')),
         sol_price_usdc=sol_price_usdc
     )
+    
     
     # Priority fee
     priority_fee = int(os.getenv('PRIORITY_FEE_LAMPORTS', '10000'))
@@ -194,8 +191,8 @@ async def main():
     elif max_slippage_bps_explicitly_set or slippage_bps_explicitly_set:
         # Log current configuration if at least one variable was explicitly set
         logger.info(
-            f"Slippage configuration: MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
-            f"SLIPPAGE_BPS={slippage_bps}"
+            f"{colors['CYAN']}Slippage configuration:{colors['RESET']} {colors['YELLOW']}MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
+            f"SLIPPAGE_BPS={slippage_bps}{colors['RESET']}"
         )
     
     # Load wallet
@@ -212,7 +209,7 @@ async def main():
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
     if sol_price_auto and sol_price_auto > 0:
         sol_price_usdc = sol_price_auto
-        logger.info(f"SOL price fetched from Jupiter API: ${sol_price_usdc:.2f} USDC")
+        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API: {colors['YELLOW']}{sol_price_usdc:.2f} USDC{colors['RESET']}")
         # Update risk_config with fetched price
         risk_config.sol_price_usdc = sol_price_usdc
         # Recalculate max_position_absolute_usdc with updated price
@@ -227,33 +224,142 @@ async def main():
     # Initialize risk manager
     risk_manager = RiskManager(risk_config)
     
+    # Initialize balance variables
+    sol_balance = 0.0
+    usdc_balance = 0.0
+    
     # Update wallet balance
     if wallet:
         balance = await solana.get_balance()
         risk_manager.update_wallet_balance(balance)
-        logger.info(f"Wallet balance: {balance / 1e9:.4f} SOL")
+        sol_balance = balance / 1e9  # Convert from lamports to SOL
+        logger.info(f"{colors['CYAN']}SOL balance: {colors['YELLOW']}{sol_balance:.4f} SOL{colors['RESET']}")
+        
+        # Get USDC balance
+        try:
+            from solana.rpc.commitment import Confirmed
+            from solana.rpc.types import TokenAccountOpts
+            
+            usdc_mint_str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+            token_program_id = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+            wallet_pubkey = wallet.pubkey()
+            
+            # Get all SPL token accounts by owner with programId filter
+            # Note: get_token_accounts_by_owner doesn't support encoding parameter
+            # We'll get raw data and parse it manually
+            from solana.rpc.types import TokenAccountOpts
+            
+            result = await solana.client.get_token_accounts_by_owner(
+                wallet_pubkey,
+                TokenAccountOpts(program_id=token_program_id),
+                commitment=Confirmed
+            )
+            
+            if result.value:
+                logger.debug(f"Found {len(result.value)} token accounts")
+                # Iterate through all token accounts to find USDC
+                for idx, account_info in enumerate(result.value):
+                    try:
+                        # Parse raw account data
+                        # SPL Token Account structure:
+                        # - mint: Pubkey (32 bytes, offset 0)
+                        # - owner: Pubkey (32 bytes, offset 32)
+                        # - amount: u64 (8 bytes, offset 64)
+                        from base64 import b64decode
+                        import struct
+                        
+                        # Get account data (base64 encoded bytes)
+                        account_data = account_info.account.data
+                        logger.debug(f"Account {idx}: data type = {type(account_data)}")
+                        
+                        # Handle different data formats
+                        account_data_bytes = None
+                        if isinstance(account_data, list) and len(account_data) > 0:
+                            # Format: ["base64string", "base58"]
+                            account_data_bytes = b64decode(account_data[0])
+                        elif isinstance(account_data, str):
+                            # Format: "base64string"
+                            account_data_bytes = b64decode(account_data)
+                        elif hasattr(account_data, '__bytes__'):
+                            # If it's already bytes
+                            account_data_bytes = bytes(account_data)
+                        elif hasattr(account_data, '__iter__') and not isinstance(account_data, (str, bytes)):
+                            # Try to get first element if it's iterable
+                            try:
+                                data_list = list(account_data)
+                                if len(data_list) > 0 and isinstance(data_list[0], str):
+                                    account_data_bytes = b64decode(data_list[0])
+                            except Exception as decode_err:
+                                logger.debug(f"Account {idx}: decode error: {decode_err}")
+                                pass
+                        
+                        if account_data_bytes is None:
+                            logger.debug(f"Account {idx}: could not decode data, type={type(account_data)}, repr={repr(account_data)[:100]}")
+                            continue
+                        
+                        logger.debug(f"Account {idx}: decoded data length = {len(account_data_bytes)}")
+                        
+                        # SPL Token Account is 165 bytes total
+                        if len(account_data_bytes) < 72:
+                            logger.debug(f"Account {idx}: data too short ({len(account_data_bytes)} bytes)")
+                            continue
+                        
+                        # Extract mint (first 32 bytes)
+                        mint_bytes = account_data_bytes[0:32]
+                        mint_pubkey = Pubkey.from_bytes(mint_bytes)
+                        mint = str(mint_pubkey)
+                        
+                        logger.debug(f"Account {idx}: mint = {mint}")
+                        
+                        # Compare with USDC mint address
+                        if mint == usdc_mint_str:
+                            # Extract amount (8 bytes, offset 64)
+                            # Use little-endian unsigned long long (Q)
+                            amount_bytes = account_data_bytes[64:72]
+                            amount = struct.unpack('<Q', amount_bytes)[0]  # u64 little-endian
+                            usdc_balance = amount / 1e6  # USDC has 6 decimals
+                            logger.debug(f"USDC found! Raw amount: {amount}, UI amount: {usdc_balance}")
+                            break  # USDC found, exit loop
+                    except Exception as e:
+                        logger.debug(f"Error parsing token account {idx}: {e}", exc_info=True)
+                        continue
+            else:
+                logger.debug("No token accounts found in result.value")
+            
+            logger.info(f"{colors['CYAN']}USDC balance: {colors['YELLOW']}{usdc_balance:.2f} USDC{colors['RESET']}")
+        except Exception as e:
+            logger.warning(f"Could not retrieve USDC balance: {e}", exc_info=True)
+            logger.info("USDC balance: 0.00 USDC")
     
-    # Get tokens from config (no hardcoded addresses)
+    # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
     tokens_config = config.get('tokens', {})
-    if not tokens_config:
-        logger.error("No tokens found in config.json. Please configure tokens in config.json")
-        return
-    
     tokens = list(tokens_config.values())
     
-    # Load cycles from config (symbols format)
-    arbitrage_config = config.get('arbitrage', {})
-    cycles = arbitrage_config.get('cycles', [])
+    # Create reverse mapping: address -> symbol
+    tokens_map = {v: k for k, v in tokens_config.items()}
+    if not tokens:
+        # Default minimal tokens (quota-safe)
+        tokens = [
+            "So11111111111111111111111111111111111111112",  # SOL
+            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",  # JUP
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
+        ]
+    
+    # Load cycles from config.json
+    cycles = config.get('cycles', [])
     if not cycles:
-        logger.warning("No cycles found in config.json.arbitrage.cycles. Using empty list.")
-        cycles = []
+        logger.warning("No cycles found in config.json. Please add cycles section to config.json")
+    
+    # Calculate test_amount (will be logged in effective config after calculation)
+    # This is done here to have cycles count available for logging
+    # Note: test_amount calculation happens later, but we'll log it there too
     
     # Initialize arbitrage finder
+    arbitrage_config = config.get('arbitrage', {})
     finder = ArbitrageFinder(
         jupiter,
         tokens,
-        cycles=cycles,  # Cycles in symbol format
-        tokens_config=tokens_config,  # Dictionary mapping symbol -> address
         min_profit_bps=risk_config.min_profit_bps,
         min_profit_usd=risk_config.min_profit_usdc,  # Use min_profit_usdc from RiskConfig
         max_cycle_length=arbitrage_config.get('max_cycle_length', 4),
@@ -261,11 +367,9 @@ async def main():
         quote_timeout=arbitrage_config.get('quote_timeout', 5.0),
         slippage_bps=slippage_bps,
         sol_price_usdc=risk_config.sol_price_usdc,
-        quote_delay_seconds=quote_delay_seconds
+        quote_delay_seconds=quote_delay_seconds,
+        cycles=cycles
     )
-    
-    # Create reverse dictionary: address -> symbol (for displaying cycles)
-    address_to_symbol = {address: symbol for symbol, address in tokens_config.items()}
     
     # Initialize trader with mode for safety checks
     trader = Trader(
@@ -277,7 +381,7 @@ async def main():
         use_jito=use_jito,
         mode=mode,  # Pass mode for strict checking
         slippage_bps=slippage_bps,
-        address_to_symbol=address_to_symbol  # Dictionary mapping address -> symbol for display
+        tokens_map=tokens_map
     )
     
     # DIAGNOSTIC MODE: Test if Jupiter can return routes at all
@@ -338,11 +442,14 @@ async def main():
         return
     
     # Determine starting token and amount
-    # Prefer SOL or USDC as base token for cycles (from config, no hardcoded addresses)
-    if "SOL" in tokens_config and tokens_config["SOL"] in tokens:
-        start_token = tokens_config["SOL"]
-    elif "USDC" in tokens_config and tokens_config["USDC"] in tokens:
-        start_token = tokens_config["USDC"]
+    # Prefer SOL or USDC as base token for cycles
+    sol_mint = "So11111111111111111111111111111111111111112"
+    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    
+    if sol_mint in tokens:
+        start_token = sol_mint
+    elif usdc_mint in tokens:
+        start_token = usdc_mint
     else:
         start_token = tokens[0]  # Fallback to first token
     
@@ -354,58 +461,90 @@ async def main():
         int(max_position_absolute_sol_calc * 1e9)
     )
     
+    # Log effective runtime configuration with test_amount and cycles count
+    logger.info(
+        f"{colors['CYAN']}Effective config:{colors['RESET']} "
+        f"mode={colors['YELLOW']}{mode}{colors['RESET']}, "
+        f"MIN_PROFIT_USDC={colors['YELLOW']}{risk_config.min_profit_usdc:.4f}{colors['RESET']}, "
+        f"MIN_PROFIT_BPS={colors['YELLOW']}{risk_config.min_profit_bps}{colors['RESET']}, "
+        f"SLIPPAGE_BPS={colors['YELLOW']}{slippage_bps}{colors['RESET']}, "
+        f"MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
+        f"MAX_POSITION_SIZE_PERCENT={colors['YELLOW']}{risk_config.max_position_size_percent}%{colors['RESET']}, "
+        f"MAX_POSITION_SIZE_ABSOLUTE_SOL={colors['YELLOW']}{max_position_absolute_sol:.4f}{colors['RESET']}, "
+        f"TEST_AMOUNT_SOL={colors['YELLOW']}{test_amount/1e9:.6f}{colors['RESET']} ({colors['YELLOW']}{test_amount}{colors['RESET']} lamports), "
+        f"QUOTE_DELAY_SECONDS={colors['YELLOW']}{quote_delay_seconds}{colors['RESET']}, "
+        f"CYCLES={colors['YELLOW']}{len(cycles)}{colors['RESET']}"
+    )
+    
     try:
         if mode == 'scan':
-            logger.info("Mode: SCAN (read-only)")
-            logger.info(f"Optimized scan: {len(tokens_config)} tokens, {len(cycles)} cycles, delay={quote_delay_seconds}s (rate-limited: {int(60/quote_delay_seconds)} req/min)")
+            logger.info(f"{colors['CYAN']}Mode: {colors['GREEN']}SCAN (read-only){colors['RESET']}")
+            usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+            sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
+            logger.info(f"Optimized scan: cycles={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
-                max_opportunities=10
+                max_opportunities=10,
+                sol_balance=sol_balance,
+                usdc_balance=usdc_balance
             )
             
-            # Get colors for TTY output
-            colors = _get_colors()
+            count = len(opportunities)
+            count_color = colors['GREEN'] if count > 0 else colors['RED']
+            if count > 0:
+                logger.info(f"Found {count_color}{count}{colors['CYAN']} profitable opportunities:{colors['RESET']}")
             
             if opportunities:
-                logger.info(
-                    f"\n{colors['BOLD']}{colors['GREEN']}Found {len(opportunities)} profitable opportunities:{colors['RESET']}"
-                )
                 for i, opp in enumerate(opportunities, 1):
+                    cycle_str = format_cycle_with_symbols(opp.cycle, tokens_map)
                     logger.info(
-                        f"\n{colors['YELLOW']}{i}.{colors['RESET']} "
-                        f"Cycle: {colors['CYAN']}{trader.format_cycle_with_symbols(opp.cycle)}{colors['RESET']}"
-                        f"\n   Profit: {colors['GREEN']}{opp.profit_bps} bps (${opp.profit_usd:.4f}){colors['RESET']}"
-                        f"\n   Initial: {opp.initial_amount / 1e9:.6f} SOL"
-                        f"\n   Final: {opp.final_amount / 1e9:.6f} SOL"
-                        f"\n   Price Impact: {opp.price_impact_total:.2f}%"
+                        f"\n{colors['CYAN']}{i}. Cycle:{colors['RESET']} {cycle_str}"
+                        f"\n   {colors['CYAN']}Profit:{colors['RESET']} {colors['GREEN']}{opp.profit_bps} bps{colors['RESET']} ({colors['YELLOW']}${opp.profit_usd:.4f}{colors['RESET']})"
+                        f"\n   {colors['CYAN']}Initial:{colors['RESET']} {colors['GREEN']}{opp.initial_amount / 1e9:.6f} SOL{colors['RESET']}"
+                        f"\n   {colors['CYAN']}Final:{colors['RESET']} {colors['GREEN']}{opp.final_amount / 1e9:.6f} SOL{colors['RESET']}"
+                        f"\n   {colors['CYAN']}Price Impact:{colors['RESET']} {colors['GREEN']}{opp.price_impact_total:.2f}%{colors['RESET']}"
                     )
             else:
-                logger.info(f"{colors['YELLOW']}No profitable opportunities found{colors['RESET']}")
+                logger.info(f"{colors['RED']}No profitable opportunities found{colors['RESET']}")
         
         elif mode == 'simulate':
-            logger.info("Mode: SIMULATE")
+            logger.info(f"{colors['CYAN']}Mode: {colors['YELLOW']}SIMULATE{colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for simulation")
                 return
             
-            # Use stream mode for immediate processing
             user_pubkey = str(wallet.pubkey())
-            async for opp in trader.scan_opportunities_stream(
+            
+            # Callback for immediate processing when opportunity is found
+            async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
+                """Process opportunity immediately with retries."""
+                cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
+                logger.info(f"{colors['GREEN']}Found opportunity: {cycle_display}{colors['RESET']}")
+                
+                success_count = await trader.process_opportunity_with_retries(
+                    opp.cycle,
+                    test_amount,
+                    user_pubkey,
+                    max_retries=10
+                )
+                
+                if success_count > 0:
+                    logger.info(f"{colors['GREEN']}Processed {success_count} successful simulations{colors['RESET']}")
+                
+                # Continue searching for more opportunities
+                return True
+            
+            # Use callback for immediate processing
+            await finder.find_opportunities(
                 start_token,
                 test_amount,
-                max_opportunities=5
-            ):
-                success, error, sim_result = await trader.simulate_opportunity(opp, user_pubkey)
-                
-                if success:
-                    logger.info(f"Simulation successful for cycle: {trader.format_cycle_with_symbols(opp.cycle)}")
-                    logger.debug(f"Simulation result: {sim_result}")
-                else:
-                    logger.warning(f"Simulation failed: {error}")
+                max_opportunities=100,  # High limit, callback will process immediately
+                on_opportunity_found=on_opportunity_found
+            )
         
         elif mode == 'live':
-            logger.info("Mode: LIVE (real trading)")
+            logger.info(f"{colors['CYAN']}Mode: {colors['RED']}LIVE (real trading){colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for live trading")
                 return
@@ -420,35 +559,51 @@ async def main():
             logger.warning("Starting live mode in 3 seconds... Press Ctrl+C to cancel")
             await asyncio.sleep(3)
             
+            user_pubkey = str(wallet.pubkey())
+            
+            # Callback for immediate processing when opportunity is found
+            async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
+                """Process opportunity immediately with retries."""
+                # Don't log "Found opportunity" here - it will be logged in process_opportunity_with_retries
+                # when actual processing starts, avoiding spam for opportunities that drop on recheck
+                
+                try:
+                    success_count = await trader.process_opportunity_with_retries(
+                        opp.cycle,
+                        test_amount,
+                        user_pubkey,
+                        max_retries=10,
+                        first_attempt_use_original_opportunity=True,
+                        original_opportunity=opp
+                    )
+                    
+                    if success_count > 0:
+                        logger.info(f"{colors['GREEN']}Processed {success_count} successful executions{colors['RESET']}")
+                    # If success_count == 0, it was already logged in process_opportunity_with_retries
+                except Exception as e:
+                    logger.error(f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}", exc_info=True)
+                
+                # Continue searching for more opportunities
+                return True
+            
             # Continuous loop
             while True:
                 try:
                     # Update balance
                     balance = await solana.get_balance()
                     risk_manager.update_wallet_balance(balance)
+                    sol_balance = balance / 1e9
                     
-                    # Use stream mode for immediate processing
-                    user_pubkey = str(wallet.pubkey())
-                    found_opportunity = False
-                    async for opp in trader.scan_opportunities_stream(
+                    # Find opportunities with callback for immediate processing
+                    await finder.find_opportunities(
                         start_token,
                         test_amount,
-                        max_opportunities=1
-                    ):
-                        found_opportunity = True
-                        # Execute
-                        success, error, tx_sig = await trader.execute_opportunity(opp, user_pubkey)
-                        
-                        if success:
-                            logger.info(f"Successfully executed arbitrage: Cycle: {trader.format_cycle_with_symbols(opp.cycle)}, TX: {tx_sig}")
-                        else:
-                            logger.warning(f"Execution failed for cycle {trader.format_cycle_with_symbols(opp.cycle)}: {error}")
-                        break  # Execute only first opportunity
+                        max_opportunities=100,  # High limit, callback will process immediately
+                        on_opportunity_found=on_opportunity_found
+                    )
                     
-                    if not found_opportunity:
-                        logger.info("No opportunities found, waiting...")
-                    
-                    # Wait before next iteration
+                    # Wait before next search iteration
+                    logger.info("No more opportunities in current cycle, waiting...")
                     await asyncio.sleep(5)
                     
                 except KeyboardInterrupt:
@@ -465,7 +620,7 @@ async def main():
         # Cleanup
         await jupiter.close()
         await solana.close()
-        logger.info("Bot stopped")
+        logger.info(f"{colors['YELLOW']}Bot stopped{colors['RESET']}")
 
 
 if __name__ == '__main__':

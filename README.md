@@ -1,4 +1,4 @@
-# Solana Arbitrage Bot
+# Solana Arbitrage Bot (v2.0.0)
 
 Off-chain arbitrage research bot for Solana using the Jupiter Aggregator API for studying and evaluating arbitrage opportunities.
 
@@ -8,20 +8,23 @@ This project is an experimental / research prototype developed iteratively.
 
 ### ✅ Stage 1 — Scan (completed)
 - **Stable Jupiter API integration** — reliable quote retrieval via public API
-- **Arbitrage path discovery** — deterministic cycle generation and evaluation
-- **Configurable token universe** — adjustable tokens and cycle depth
+- **Arbitrage path discovery** — cycles and tokens loaded from config.json
+- **Configurable token universe** — adjustable tokens and cycle depth via config.json
 - **Quota-optimized scanning** — rate-limited execution (60 requests/minute) with configurable delays
-- **12 predefined cycles** — doubled coverage while respecting API quotas (~40-45 seconds per scan)
+- **Repository default: 20 fixed 3-leg cycles** — loaded from config.json (14 USDC-based, 6 SOL-based)
+- **Repository default tokens: SOL, USDC, JUP, BONK, WIF, RAY** — 6 tokens configured in config.json
 - **Read-only mode** — no on-chain execution or fund usage
 
 ### 🛠️ Stage 2 — Simulation (in progress)
-- **On-chain transaction simulation** before execution
-- **Full cycle validation** using simulated swaps
+- **On-chain transaction simulation** via RPC `simulateTransaction` (no real transactions sent)
+- **⚠️ First-leg proxy only** — current implementation simulates only the first leg of the cycle, not full multi-leg arbitrage
 - **Priority fee & latency experiments**
 - **Execution feasibility analysis**
 
-### 🧪 Stage 3 — Live Execution (planned / experimental)
-- **Real transaction submission**
+### 🧪 Stage 3 — Live Execution (experimental)
+- **Real transaction submission** to Solana network
+- **⚠️ First-leg proxy only** — current implementation executes only the first leg of the cycle, not full multi-leg arbitrage
+- **⚠️ Not full-cycle arbitrage** — atomic multi-leg transactions not yet implemented
 - **Optional Jito integration**
 - **Research-only, not production-ready**
 
@@ -74,18 +77,19 @@ Main parameters (see `env.example` for complete list):
 RPC_URL=https://api.mainnet-beta.solana.com
 
 # Operation Mode
-MODE=scan  # scan, simulate, or live
+# Note: Mode is now specified via command line argument (default: scan)
+# Usage: python run.py [scan|simulate|live]
 
 # Wallet private key (base58, required for simulate/live modes)
 WALLET_PRIVATE_KEY=your_private_key_here
 
 # Risk Management (all absolute limits in USDC)
-MAX_POSITION_SIZE_PERCENT=10.0
+MAX_POSITION_SIZE_PERCENT=10.0  # Maximum position size (% of balance)
 MAX_POSITION_SIZE_ABSOLUTE=1.0  # in SOL
-MIN_PROFIT_USDC=0.1  # PRIMARY: minimum profit in USDC
-MIN_PROFIT_BPS=50  # SECONDARY: optional filter (set to 0 to disable)
-MAX_SLIPPAGE_BPS=50  # Maximum allowed slippage (risk limit)
-SLIPPAGE_BPS=50  # Actual slippage used in Jupiter API requests
+MIN_PROFIT_USDC=0.03  # PRIMARY: minimum profit in USDC
+MIN_PROFIT_BPS=0  # SECONDARY: optional filter (set to 0 to disable)
+MAX_SLIPPAGE_BPS=200  # Maximum allowed slippage (risk limit)
+SLIPPAGE_BPS=100  # Actual slippage used in Jupiter API requests
 MAX_ACTIVE_POSITIONS=1
 
 # Arbitrage Configuration
@@ -115,15 +119,21 @@ Additional settings:
     "SOL": "So11111111111111111111111111111111111111112",
     "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
     "JUP": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
-    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+    "BONK": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+    "WIF": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm",
+    "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
   },
   "arbitrage": {
     "min_profit_usdc": 0.1,
     "max_cycle_length": 4,
+    "max_cycles": 100,
     "quote_timeout": 5.0
-  }
+  },
+  "cycles": []
 }
 ```
+
+**Note:** The `cycles` is empty in this example for brevity — use the repository config.json to get the full 20-cycle list.
 
 ## Usage
 
@@ -132,14 +142,19 @@ Additional settings:
 Read-only mode for analyzing potential arbitrage paths without executing transactions:
 
 ```bash
+# Default mode (scan is used if no argument provided)
+python run.py
+
+# Or explicitly specify scan mode
 python run.py scan
 ```
 
 **Configuration:**
-- 12 predefined 3-leg cycles (A → B → C → A format)
-- 4 tokens: SOL, USDC, JUP, BONK
+- Cycles loaded from `config.json`: repository default is 20 fixed 3-leg cycles (A → B → C → A format)
+- Tokens loaded from `config.json`: repository default is 6 tokens (SOL, USDC, JUP, BONK, WIF, RAY)
+- Requests per pass: 20 cycles × 3 legs = 60 quote requests
 - Rate-limited to 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
-- Execution time: ~40-45 seconds per scan
+- Execution time: ~60 seconds per full pass + overhead (with `QUOTE_DELAY_SECONDS=1.0`)
 
 **Output** (if available):
 - List of found opportunities
@@ -148,13 +163,15 @@ python run.py scan
 
 ### Simulate Mode
 
-Simulation mode attempts to execute the trading logic without sending real transactions.
+Simulation mode uses Solana RPC `simulateTransaction` to test transaction execution without sending real transactions.
 Intended for research and testing purposes:
 
 ```bash
 # Make sure WALLET_PRIVATE_KEY is set in .env
 python run.py simulate
 ```
+
+**⚠️ Important:** Current implementation simulates only the first leg of the cycle as a proxy, not full multi-leg arbitrage. This is because Jupiter API doesn't support multi-leg swaps directly, and building atomic multi-leg transactions is not yet implemented.
 
 Required:
 - Configured `WALLET_PRIVATE_KEY` in .env
@@ -164,8 +181,13 @@ Required:
 
 ⚠️ **WARNING**: Live mode sends real transactions to the network!
 
-Live mode attempts to execute arbitrage transactions on-chain.
-Disabled by default and not guaranteed to function due to aggregator API limitations.
+⚠️ **CRITICAL LIMITATION**: Live mode is **NOT full-cycle arbitrage**. Current implementation executes only the first leg of the cycle as a proxy. This is because:
+- Jupiter API doesn't support multi-leg swaps directly
+- Atomic multi-leg transactions are not yet implemented
+- The bot simulates/executes only the first swap (A → B) of the cycle (A → B → C → A)
+
+Live mode attempts to execute the first leg of arbitrage transactions on-chain.
+This is experimental and not guaranteed to function due to aggregator API limitations.
 
 ```bash
 # Make sure all settings are verified!
@@ -183,7 +205,7 @@ Runs a single direct quote request to verify that the aggregator API
 can build swap routes, then exits immediately.
 
 ```bash
-DIAGNOSTIC_MODE=true python run.py
+DIAGNOSTIC_MODE=true python run.py scan
 ```
 
 ## Risk & Capital Management
@@ -233,13 +255,13 @@ src/
 ## How It Works
 
 1. **Opportunity search** (`arbitrage_finder.py`)
-   - Evaluates 12 predefined 3-leg exchange cycles (A → B → C → A format)
-   - Uses 4 tokens: SOL, USDC, JUP, BONK
+   - Loads cycles and tokens from `config.json` (repository default: 20 fixed 3-leg cycles, 6 tokens)
+   - Evaluates 3-leg exchange cycles (A → B → C → A format)
    - Rate-limited to 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
-   - Gets quotes via Jupiter Quote API
+   - Gets quotes via Jupiter Quote API (burst mode: all legs of a cycle queried quickly, then delay)
    - Calculates profit accounting for fees and slippage
-   - The project uses 12 predefined 3-leg cycles for quota-optimized scanning
-   - Execution time: ~40-45 seconds per scan (rate-limited at 60 req/min)
+   - Filters by PRIMARY: `MIN_PROFIT_USDC` (always applied) and SECONDARY: `MIN_PROFIT_BPS` (optional, set to 0 to disable)
+   - Execution time: ~60 seconds per full pass + overhead (20 cycles × 3 requests = 60 requests with 1.0s delay)
 
 2. **Risk check** (`risk_manager.py`)
    - Checks all limits
@@ -247,11 +269,13 @@ src/
    - Controls active positions
 
 3. **Simulation** (`solana_client.py`)
-   - Simulates transaction before sending
-   - Validates results
+   - Simulates transaction via RPC `simulateTransaction` before sending
+   - ⚠️ **Current limitation**: Only simulates first leg of cycle (first-leg proxy)
+   - Validates results (first leg output only)
 
 4. **Execution** (`trader.py`)
-   - Builds transaction via Jupiter Swap API
+   - Builds transaction via Jupiter Swap API (first leg only)
+   - ⚠️ **Current limitation**: Only executes first leg of cycle, not full multi-leg arbitrage
    - Sends to network
    - Waits for confirmation
 
@@ -266,9 +290,10 @@ src/
 
 ### Limitations
 
-- Bot searches for 3-leg cycles (A → B → C → A format) using 4 tokens: SOL, USDC, JUP, BONK
+- **⚠️ Simulation/live are not full-cycle arbitrage yet**: Current implementation is effectively first-leg proxy. The bot simulates/executes only the first swap (A → B) of the cycle (A → B → C → A), not the full multi-leg arbitrage. This is because Jupiter API doesn't support multi-leg swaps directly, and atomic multi-leg transactions are not yet implemented.
+- Cycles and tokens are loaded from `config.json` (repository default: 20 fixed 3-leg cycles, 6 tokens: SOL, USDC, JUP, BONK, WIF, RAY)
 - Jupiter API rate limit: 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
-- Scan execution time: ~40-45 seconds (12 cycles, 36 requests total)
+- Scan execution time: ~60 seconds per full pass + overhead (20 cycles × 3 requests = 60 requests with 1.0s delay)
 - RPC latency affects arbitrage success
 - MEV bots may outpace your transactions
 
@@ -294,7 +319,7 @@ src/
 
 ### No opportunities found
 - This is normal behavior. Public aggregator APIs may return no routes even for liquid pairs.
-- Try increasing `MIN_PROFIT_BPS` or decreasing `min_profit_usdc`
+- Try decreasing MIN_PROFIT_USDC (primary filter) or setting MIN_PROFIT_BPS=0 to disable bps filter.
 
 ## License
 
