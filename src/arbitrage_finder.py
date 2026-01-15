@@ -109,8 +109,44 @@ class ArbitrageFinder:
         for cycle in cycles:
             result = await self._check_cycle(cycle, amount)
             
-            if result and result.is_valid(self.min_profit_bps, self.min_profit_usd):
-                opportunities.append(result)
+            if result:
+                # Check validity and log rejection reasons at DEBUG level
+                is_valid = result.is_valid(self.min_profit_bps, self.min_profit_usd)
+                
+                if not is_valid:
+                    # Log why opportunity was rejected (DEBUG level to avoid noise)
+                    rejection_reasons = []
+                    if result.profit_usd < self.min_profit_usd:
+                        rejection_reasons.append(
+                            f"profit_usd={result.profit_usd:.4f} < min_profit_usd={self.min_profit_usd:.4f}"
+                        )
+                    if self.min_profit_bps > 0 and result.profit_bps < self.min_profit_bps:
+                        rejection_reasons.append(
+                            f"profit_bps={result.profit_bps} < min_profit_bps={self.min_profit_bps}"
+                        )
+                    
+                    logger.debug(
+                        f"Opportunity rejected: {'; '.join(rejection_reasons)} "
+                        f"(cycle: {' -> '.join(result.cycle[:3])}...)"
+                    )
+                else:
+                    # Safety assertion: ensure opportunity meets minimum requirements
+                    if result.profit_usd < self.min_profit_usd:
+                        logger.error(
+                            f"CRITICAL: Opportunity passed is_valid() but profit_usd={result.profit_usd:.4f} < "
+                            f"min_profit_usd={self.min_profit_usd:.4f}. Skipping to prevent invalid results."
+                        )
+                        continue  # Skip this opportunity
+                    
+                    if self.min_profit_bps > 0 and result.profit_bps < self.min_profit_bps:
+                        logger.error(
+                            f"CRITICAL: Opportunity passed is_valid() but profit_bps={result.profit_bps} < "
+                            f"min_profit_bps={self.min_profit_bps}. Skipping to prevent invalid results."
+                        )
+                        continue  # Skip this opportunity
+                    
+                    # All checks passed - safe to append
+                    opportunities.append(result)
                 
                 # If callback provided, call it immediately (processing will pause the search loop)
                 if on_opportunity_found:
@@ -126,12 +162,16 @@ class ArbitrageFinder:
                         # Callback requested to stop searching
                         logger.info("Callback requested to stop searching")
                         break
-                    # Skip delay if callback was called (processing already paused the loop)
+                    # Apply delay after callback (rate limiting per cycle)
+                    # Delay is proportional to number of quote requests in the cycle
+                    quotes_per_cycle = len(cycle) - 1
+                    await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
                     continue
             
-            # Delay between cycles for rate limiting (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
-            # Skip delay if callback was called (already continued above)
-            await asyncio.sleep(self.quote_delay_seconds)
+            # Delay between cycles for rate limiting (proportional to number of quote requests)
+            # This maintains ~60 req/min average while allowing burst quotes within a cycle
+            quotes_per_cycle = len(cycle) - 1
+            await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.profit_bps, reverse=True)
@@ -225,10 +265,8 @@ class ArbitrageFinder:
                 quotes.append(quote)
                 current_amount = quote.out_amount
                 
-                # Delay between quote requests within a cycle (configurable via QUOTE_DELAY_SECONDS, default: 1.0 sec for 60 req/min)
-                # Skip delays for fast retry checks
-                if not skip_delays and i < len(cycle) - 2:  # Don't delay after last leg
-                    await asyncio.sleep(self.quote_delay_seconds)
+                # NO delays between legs within a cycle - take quotes in burst for consistency
+                # Rate limiting is handled by delay AFTER the cycle (proportional to number of requests)
             
             # Calculate profit
             final_amount = current_amount

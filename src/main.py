@@ -152,6 +152,7 @@ async def main(mode: str = 'scan'):
         sol_price_usdc=sol_price_usdc
     )
     
+    
     # Priority fee
     priority_fee = int(os.getenv('PRIORITY_FEE_LAMPORTS', '10000'))
     use_jito = os.getenv('USE_JITO', 'false').lower() == 'true'
@@ -350,6 +351,10 @@ async def main(mode: str = 'scan'):
     if not cycles:
         logger.warning("No cycles found in config.json. Please add cycles section to config.json")
     
+    # Calculate test_amount (will be logged in effective config after calculation)
+    # This is done here to have cycles count available for logging
+    # Note: test_amount calculation happens later, but we'll log it there too
+    
     # Initialize arbitrage finder
     arbitrage_config = config.get('arbitrage', {})
     finder = ArbitrageFinder(
@@ -454,6 +459,21 @@ async def main(mode: str = 'scan'):
     test_amount = min(
         int(available_balance * risk_config.max_position_size_percent / 100),
         int(max_position_absolute_sol_calc * 1e9)
+    )
+    
+    # Log effective runtime configuration with test_amount and cycles count
+    logger.info(
+        f"{colors['CYAN']}Effective config:{colors['RESET']} "
+        f"mode={colors['YELLOW']}{mode}{colors['RESET']}, "
+        f"MIN_PROFIT_USDC={colors['YELLOW']}{risk_config.min_profit_usdc:.4f}{colors['RESET']}, "
+        f"MIN_PROFIT_BPS={colors['YELLOW']}{risk_config.min_profit_bps}{colors['RESET']}, "
+        f"SLIPPAGE_BPS={colors['YELLOW']}{slippage_bps}{colors['RESET']}, "
+        f"MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
+        f"MAX_POSITION_SIZE_PERCENT={colors['YELLOW']}{risk_config.max_position_size_percent}%{colors['RESET']}, "
+        f"MAX_POSITION_SIZE_ABSOLUTE_SOL={colors['YELLOW']}{max_position_absolute_sol:.4f}{colors['RESET']}, "
+        f"TEST_AMOUNT_SOL={colors['YELLOW']}{test_amount/1e9:.6f}{colors['RESET']} ({colors['YELLOW']}{test_amount}{colors['RESET']} lamports), "
+        f"QUOTE_DELAY_SECONDS={colors['YELLOW']}{quote_delay_seconds}{colors['RESET']}, "
+        f"CYCLES={colors['YELLOW']}{len(cycles)}{colors['RESET']}"
     )
     
     try:

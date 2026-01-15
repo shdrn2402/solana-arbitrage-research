@@ -132,7 +132,18 @@ class Trader:
                 if success:
                     success_count += 1
                     cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
-                    logger.info(f"{colors['GREEN']}Simulation #{success_count} successful for cycle: {cycle_display}{colors['RESET']}")
+                    
+                    # Format initial/final amounts based on starting token
+                    start_token = opportunity.cycle[0]
+                    initial_display = self._format_amount(opportunity.initial_amount, start_token)
+                    final_display = self._format_amount(opportunity.final_amount, start_token)
+                    
+                    logger.info(
+                        f"{colors['GREEN']}Simulation #{success_count} successful for cycle: {cycle_display} | "
+                        f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
+                        f"Initial: {initial_display} | "
+                        f"Final: {final_display}{colors['RESET']}"
+                    )
                     # Continue to next retry
                 else:
                     logger.warning(f"{colors['RED']}Simulation failed: {colors['YELLOW']}{error}{colors['RESET']}")
@@ -144,10 +155,22 @@ class Trader:
                 if success:
                     success_count += 1
                     cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
-                    logger.info(f"{colors['GREEN']}Execution #{success_count} successful: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+                    
+                    # Format initial/final amounts based on starting token
+                    start_token = opportunity.cycle[0]
+                    initial_display = self._format_amount(opportunity.initial_amount, start_token)
+                    final_display = self._format_amount(opportunity.final_amount, start_token)
+                    
+                    logger.info(
+                        f"{colors['GREEN']}Execution #{success_count} successful: {colors['CYAN']}{tx_sig}{colors['RESET']} | "
+                        f"Cycle: {cycle_display} | "
+                        f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
+                        f"Initial: {initial_display} | "
+                        f"Final: {final_display}"
+                    )
                     # Continue to next retry
                 else:
-                    logger.warning(f"{colors['RED']}Execution failed: {colors['YELLOW']}{error}{colors['RESET']}")
+                    logger.warning(f"{colors['RED']}Execution failed: {error}{colors['RESET']}")
                     break  # Stop retrying on failure
             
             else:
@@ -159,6 +182,50 @@ class Trader:
             logger.debug(f"Processed {success_count} executions in {total_duration_ms:.1f}ms")
         
         return success_count
+    
+    def _format_amount(self, amount: int, token_mint: str) -> str:
+        """
+        Format amount based on token type (SOL, USDC, or unknown).
+        
+        Args:
+            amount: Amount in smallest units
+            token_mint: Token mint address
+        
+        Returns:
+            Formatted string with amount and token symbol
+        """
+        sol_mint = "So11111111111111111111111111111111111111112"
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        
+        if token_mint == sol_mint:
+            return f"{amount/1e9:.6f} SOL"
+        elif token_mint == usdc_mint:
+            return f"{amount/1e6:.2f} USDC"
+        else:
+            # Unknown token, show raw amount
+            return f"{amount}"
+    
+    def _format_sim_logs(self, logs: list, tail: int = 20) -> str:
+        """
+        Format simulation logs, showing only last N lines to avoid spam.
+        
+        Args:
+            logs: List of log strings from simulation
+            tail: Number of last lines to show
+        
+        Returns:
+            Formatted string with log lines
+        """
+        if not logs:
+            return "  (no logs)"
+        
+        # Show full logs in DEBUG, tail in INFO/WARNING
+        if logger.isEnabledFor(logging.DEBUG):
+            lines_to_show = logs
+        else:
+            lines_to_show = logs[-tail:] if len(logs) > tail else logs
+        
+        return "\n".join(f"  {log}" for log in lines_to_show)
     
     async def simulate_opportunity(
         self,
@@ -200,10 +267,16 @@ class Trader:
         )
         
         if sim_result is None:
-            return False, "Simulation failed", None, None
+            return False, "Simulation failed (no result from RPC)", None, None
         
         if sim_result.get("err"):
-            return False, f"Simulation error: {sim_result['err']}", sim_result, swap_response
+            # Include simulation logs in error message for debugging
+            err_msg = f"Simulation error: {sim_result['err']}"
+            logs = sim_result.get("logs", [])
+            if logs:
+                log_tail = self._format_sim_logs(logs, tail=20)
+                err_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+            return False, err_msg, sim_result, swap_response
         
         return True, None, sim_result, swap_response
     
@@ -268,7 +341,13 @@ class Trader:
             )
             
             if not sim_success:
-                return False, f"Simulation failed (MANDATORY): {sim_error}", None
+                # sim_error already includes logs if available
+                error_msg = f"Simulation failed (MANDATORY): {sim_error}"
+                # If sim_result has logs but they weren't included in sim_error, add them
+                if sim_result and sim_result.get("logs") and "Simulation logs" not in sim_error:
+                    log_tail = self._format_sim_logs(sim_result.get("logs", []), tail=20)
+                    error_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+                return False, error_msg, None
             
             if swap_response is None:
                 return False, "No swap transaction from simulation", None

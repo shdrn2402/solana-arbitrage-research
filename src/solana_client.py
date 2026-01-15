@@ -123,17 +123,21 @@ class SolanaClient:
                 commitment=commitment
             )
             
-            if result.value.err:
-                logger.warning(f"Simulation error: {result.value.err}")
-                return None
-            
-            return {
+            # Always return simulation result dict, even on error
+            # This allows higher-level code to access logs for debugging
+            sim_result = {
                 "err": result.value.err,
-                "logs": result.value.logs,
+                "logs": result.value.logs or [],
                 "accounts": result.value.accounts,
                 "units_consumed": result.value.units_consumed,
                 "return_data": result.value.return_data
             }
+            
+            if result.value.err:
+                # Log concise warning with error code (full logs will be printed by caller)
+                logger.warning(f"Simulation error: {result.value.err}")
+            
+            return sim_result
             
         except Exception as e:
             logger.error(f"Error simulating transaction: {e}")
