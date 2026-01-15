@@ -174,12 +174,13 @@ class SolanaClient:
             
             # Sign if wallet is available
             if self.wallet:
-                if isinstance(transaction, VersionedTransaction):
-                    # VersionedTransaction signing
-                    transaction.sign([self.wallet])
-                else:
-                    # Legacy Transaction signing
-                    transaction.sign(self.wallet)
+                # Avoid isinstance(transaction, VersionedTransaction) here:
+                # in unit tests VersionedTransaction may be patched to a mock (not a type),
+                # which makes isinstance() blow up. Instead, try the v0 signing form first.
+                try:
+                    transaction.sign([self.wallet])  # VersionedTransaction expects a list of signers
+                except TypeError:
+                    transaction.sign(self.wallet)  # Legacy Transaction signing
             
             # Send with retries
             for attempt in range(max_retries):

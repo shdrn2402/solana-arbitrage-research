@@ -205,7 +205,7 @@ class Trader:
             # Unknown token, show raw amount
             return f"{amount}"
     
-    def _format_sim_logs(self, logs: list, tail: int = 20) -> str:
+    def _format_sim_logs(self, logs, tail: int = 20) -> str:
         """
         Format simulation logs, showing only last N lines to avoid spam.
         
@@ -216,7 +216,8 @@ class Trader:
         Returns:
             Formatted string with log lines
         """
-        if not logs:
+        # logs should be a list[str], but be defensive (tests/mocks may pass non-list)
+        if not logs or not isinstance(logs, (list, tuple)):
             return "  (no logs)"
         
         # Show full logs in DEBUG, tail in INFO/WARNING
@@ -268,6 +269,10 @@ class Trader:
         
         if sim_result is None:
             return False, "Simulation failed (no result from RPC)", None, None
+
+        # Be defensive: RPC client should return a dict, but mocks may return other objects
+        if not isinstance(sim_result, dict):
+            return False, f"Simulation failed (invalid result type: {type(sim_result).__name__})", None, swap_response
         
         if sim_result.get("err"):
             # Include simulation logs in error message for debugging

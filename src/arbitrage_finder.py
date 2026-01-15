@@ -4,7 +4,7 @@ Searches for cycles starting and ending in USDC (3-leg and 4-leg formats) with p
 """
 import asyncio
 import logging
-from typing import List, Dict, Optional, Tuple, Callable, Awaitable
+from typing import List, Optional, Tuple, Callable, Awaitable, AsyncIterator
 from dataclasses import dataclass
 import time
 
@@ -50,8 +50,6 @@ class ArbitrageFinder:
         self,
         jupiter_client: JupiterClient,
         tokens: List[str],
-        cycles: List[List[str]],  # Cycles in symbol format [["USDC", "SOL", "JUP", "USDC"], ...]
-        tokens_config: Dict[str, str],  # Dictionary mapping symbol -> address
         min_profit_bps: int = 50,
         min_profit_usd: float = 0.1,
         max_cycle_length: int = 4,
@@ -60,12 +58,10 @@ class ArbitrageFinder:
         slippage_bps: int = 50,
         sol_price_usdc: float = 100.0,
         quote_delay_seconds: float = 1.0,
-        cycles: List[List[str]] = None
+        cycles: Optional[List[List[str]]] = None
     ):
         self.jupiter = jupiter_client
         self.tokens = tokens
-        self.cycles_symbols = cycles  # Cycles in symbol format
-        self.tokens_config = tokens_config
         self.min_profit_bps = min_profit_bps
         self.min_profit_usd = min_profit_usd
         self.max_cycle_length = max_cycle_length
@@ -74,7 +70,7 @@ class ArbitrageFinder:
         self.slippage_bps = slippage_bps
         self.sol_price_usdc = sol_price_usdc
         self.quote_delay_seconds = quote_delay_seconds
-        self.cycles = cycles or []  # Load cycles from config.json
+        self.cycles = cycles or []  # Cycles from config.json
     
     async def find_opportunities(
         self,
@@ -204,8 +200,8 @@ class ArbitrageFinder:
         """
         found_count = 0
         
-        # Use cycles from config (already converted to addresses in init)
-        cycles = self.cycles_addresses
+        # Use cycles from config.json (already in mint-address form)
+        cycles = self.cycles
         
         logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities (stream mode)...")
         
@@ -312,7 +308,19 @@ class ArbitrageFinder:
         
         Returns profit in USDC.
         """
-        # Simplified: uses SOL price from config for conversion
-        # In production, should use price oracle based on token_mint for more accurate calculation
-        profit_sol = (amount_out - amount_in) / 1e9
-        return profit_sol * self.sol_price_usdc
+        # NOTE: We only support accurate estimation for cycles starting in SOL or USDC.
+        # For other tokens, a real price oracle is required.
+        sol_mint = "So11111111111111111111111111111111111111112"
+        usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+        profit_raw = amount_out - amount_in
+        if token_mint == usdc_mint:
+            # USDC has 6 decimals
+            return profit_raw / 1e6
+        if token_mint == sol_mint:
+            # SOL has 9 decimals; convert to USDC via configured SOL price
+            profit_sol = profit_raw / 1e9
+            return profit_sol * self.sol_price_usdc
+
+        # Unknown base token: can't estimate reliably
+        return 0.0

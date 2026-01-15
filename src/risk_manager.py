@@ -83,19 +83,19 @@ class RiskManager:
         available = self.get_available_balance()
         if amount_in > available:
             return False, f"Insufficient balance: need {amount_in/1e9:.4f} SOL, have {available/1e9:.4f} SOL"
-        
-        # Check position size limits (percentage)
-        position_percent = (amount_in / self.wallet_balance * 100) if self.wallet_balance > 0 else 0
-        if position_percent > self.config.max_position_size_percent:
-            return False, (f"Position size exceeds limit: {position_percent:.2f}% > "
-                          f"{self.config.max_position_size_percent}%")
-        
+
         # Check position size limits (absolute) - converted to USDC
         position_sol = amount_in / 1e9
         position_usdc = position_sol * self.config.sol_price_usdc
         if position_usdc > self.config.max_position_size_absolute_usdc:
             return False, (f"Position size exceeds absolute limit: ${position_usdc:.2f} USDC > "
                           f"${self.config.max_position_size_absolute_usdc} USDC")
+
+        # Check position size limits (percentage)
+        position_percent = (amount_in / self.wallet_balance * 100) if self.wallet_balance > 0 else 0
+        if position_percent > self.config.max_position_size_percent:
+            return False, (f"Position size exceeds limit: {position_percent:.2f}% > "
+                          f"{self.config.max_position_size_percent}%")
         
         # PRIMARY: Check minimum profit in USDC (absolute)
         # This is the main safety check - profit must be meaningful in absolute terms
