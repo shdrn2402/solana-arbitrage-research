@@ -128,6 +128,16 @@ class Trader:
                         # Dropped before first execution - this is the "died before execution" case
                         logger.info(f"{colors['RED']}Opportunity dropped before execution (recheck not profitable):{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (recheck: {recheck_duration_ms:.1f}ms)")
                     break
+
+            # Safety: never simulate/execute an opportunity that doesn't meet current thresholds.
+            # This protects the "zero-recheck first attempt" path too.
+            if not opportunity.is_valid(self.finder.min_profit_bps, self.finder.min_profit_usd):
+                logger.info(
+                    f"{colors['RED']}Opportunity rejected before processing (not profitable):{colors['RESET']} "
+                    f"{colors['YELLOW']}{cycle_display}{colors['RESET']} | "
+                    f"profit_bps={opportunity.profit_bps}, profit_usdc={opportunity.profit_usd:.4f}"
+                )
+                break
             
             # Process based on mode
             if self.mode == 'simulate':

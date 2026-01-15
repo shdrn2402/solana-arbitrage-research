@@ -136,6 +136,8 @@ class ArbitrageFinder:
                         f"Opportunity rejected: {'; '.join(rejection_reasons)} "
                         f"(cycle: {' -> '.join(result.cycle[:3])}...)"
                     )
+                    # Not profitable -> do NOT call callback / do NOT append
+                    continue
                 else:
                     # Safety assertion: ensure opportunity meets minimum requirements
                     if result.profit_usd < self.min_profit_usd:
@@ -154,26 +156,26 @@ class ArbitrageFinder:
                     
                     # All checks passed - safe to append
                     opportunities.append(result)
-                
-                # If callback provided, call it immediately (processing will pause the search loop)
-                if on_opportunity_found:
-                    logger.info("Calling on_opportunity_found callback...")
-                    try:
-                        should_continue = await on_opportunity_found(result)
-                        logger.info(f"Callback finished, should_continue={should_continue}")
-                    except Exception as e:
-                        logger.error(f"Error in on_opportunity_found callback: {e}", exc_info=True)
-                        should_continue = True  # Continue on error to avoid blocking
-                    
-                    if not should_continue:
-                        # Callback requested to stop searching
-                        logger.info("Callback requested to stop searching")
-                        break
-                    # Apply delay after callback (rate limiting per cycle)
-                    # Delay is proportional to number of quote requests in the cycle
-                    quotes_per_cycle = len(cycle) - 1
-                    await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
-                    continue
+
+                    # If callback provided, call it immediately (processing will pause the search loop)
+                    if on_opportunity_found:
+                        logger.info("Calling on_opportunity_found callback...")
+                        try:
+                            should_continue = await on_opportunity_found(result)
+                            logger.info(f"Callback finished, should_continue={should_continue}")
+                        except Exception as e:
+                            logger.error(f"Error in on_opportunity_found callback: {e}", exc_info=True)
+                            should_continue = True  # Continue on error to avoid blocking
+                        
+                        if not should_continue:
+                            # Callback requested to stop searching
+                            logger.info("Callback requested to stop searching")
+                            break
+                        # Apply delay after callback (rate limiting per cycle)
+                        # Delay is proportional to number of quote requests in the cycle
+                        quotes_per_cycle = len(cycle) - 1
+                        await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
+                        continue
             
             # Delay between cycles for rate limiting (proportional to number of quote requests)
             # This maintains ~60 req/min average while allowing burst quotes within a cycle
