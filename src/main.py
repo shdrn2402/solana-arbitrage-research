@@ -453,13 +453,29 @@ async def main(mode: str = 'scan'):
     else:
         start_token = tokens[0]  # Fallback to first token
     
-    available_balance = risk_manager.get_available_balance() if wallet else 1_000_000_000  # 1 SOL default
-    # Convert max_position_size_absolute_usdc back to SOL for test_amount calculation
+    # Compute per-base-token test amounts (SOL and USDC have different decimals and balances).
+    # This makes USDC-based cycles comparable/fair instead of reusing SOL lamports for all cycles.
     max_position_absolute_sol_calc = risk_config.max_position_size_absolute_usdc / risk_config.sol_price_usdc
-    test_amount = min(
-        int(available_balance * risk_config.max_position_size_percent / 100),
+
+    available_sol_lamports = risk_manager.get_available_balance() if wallet else 1_000_000_000  # 1 SOL default
+    test_amount_sol = min(
+        int(available_sol_lamports * risk_config.max_position_size_percent / 100),
         int(max_position_absolute_sol_calc * 1e9)
     )
+
+    available_usdc_units = int(usdc_balance * 1e6)  # USDC has 6 decimals
+    test_amount_usdc = min(
+        int(available_usdc_units * risk_config.max_position_size_percent / 100),
+        int(risk_config.max_position_size_absolute_usdc * 1e6)
+    )
+
+    # Backward-compatible default (used for logs/start_token only)
+    test_amount = test_amount_sol if start_token == sol_mint else test_amount_usdc
+
+    amounts_by_mint = {
+        sol_mint: test_amount_sol,
+        usdc_mint: test_amount_usdc
+    }
     
     # Log effective runtime configuration with test_amount and cycles count
     logger.info(
@@ -471,7 +487,8 @@ async def main(mode: str = 'scan'):
         f"MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
         f"MAX_POSITION_SIZE_PERCENT={colors['YELLOW']}{risk_config.max_position_size_percent}%{colors['RESET']}, "
         f"MAX_POSITION_SIZE_ABSOLUTE_SOL={colors['YELLOW']}{max_position_absolute_sol:.4f}{colors['RESET']}, "
-        f"TEST_AMOUNT_SOL={colors['YELLOW']}{test_amount/1e9:.6f}{colors['RESET']} ({colors['YELLOW']}{test_amount}{colors['RESET']} lamports), "
+        f"TEST_AMOUNT_SOL={colors['YELLOW']}{test_amount_sol/1e9:.6f}{colors['RESET']} ({colors['YELLOW']}{test_amount_sol}{colors['RESET']} lamports), "
+        f"TEST_AMOUNT_USDC={colors['YELLOW']}{test_amount_usdc/1e6:.2f}{colors['RESET']} ({colors['YELLOW']}{test_amount_usdc}{colors['RESET']} units), "
         f"QUOTE_DELAY_SECONDS={colors['YELLOW']}{quote_delay_seconds}{colors['RESET']}, "
         f"CYCLES={colors['YELLOW']}{len(cycles)}{colors['RESET']}"
     )
@@ -487,7 +504,8 @@ async def main(mode: str = 'scan'):
                 test_amount,
                 max_opportunities=10,
                 sol_balance=sol_balance,
-                usdc_balance=usdc_balance
+                usdc_balance=usdc_balance,
+                amounts_by_mint=amounts_by_mint
             )
             
             count = len(opportunities)
@@ -498,11 +516,14 @@ async def main(mode: str = 'scan'):
             if opportunities:
                 for i, opp in enumerate(opportunities, 1):
                     cycle_str = format_cycle_with_symbols(opp.cycle, tokens_map)
+                    base_mint = opp.cycle[0]
+                    initial_display = trader._format_amount(opp.initial_amount, base_mint)
+                    final_display = trader._format_amount(opp.final_amount, base_mint)
                     logger.info(
                         f"\n{colors['CYAN']}{i}. Cycle:{colors['RESET']} {cycle_str}"
                         f"\n   {colors['CYAN']}Profit:{colors['RESET']} {colors['GREEN']}{opp.profit_bps} bps{colors['RESET']} ({colors['YELLOW']}${opp.profit_usd:.4f}{colors['RESET']})"
-                        f"\n   {colors['CYAN']}Initial:{colors['RESET']} {colors['GREEN']}{opp.initial_amount / 1e9:.6f} SOL{colors['RESET']}"
-                        f"\n   {colors['CYAN']}Final:{colors['RESET']} {colors['GREEN']}{opp.final_amount / 1e9:.6f} SOL{colors['RESET']}"
+                        f"\n   {colors['CYAN']}Initial:{colors['RESET']} {colors['GREEN']}{initial_display}{colors['RESET']}"
+                        f"\n   {colors['CYAN']}Final:{colors['RESET']} {colors['GREEN']}{final_display}{colors['RESET']}"
                         f"\n   {colors['CYAN']}Price Impact:{colors['RESET']} {colors['GREEN']}{opp.price_impact_total:.2f}%{colors['RESET']}"
                     )
             else:
@@ -524,9 +545,11 @@ async def main(mode: str = 'scan'):
                 
                 success_count = await trader.process_opportunity_with_retries(
                     opp.cycle,
-                    test_amount,
+                    opp.initial_amount,
                     user_pubkey,
-                    max_retries=10
+                    max_retries=10,
+                    first_attempt_use_original_opportunity=True,
+                    original_opportunity=opp
                 )
                 
                 if success_count > 0:
@@ -540,7 +563,8 @@ async def main(mode: str = 'scan'):
                 start_token,
                 test_amount,
                 max_opportunities=100,  # High limit, callback will process immediately
-                on_opportunity_found=on_opportunity_found
+                on_opportunity_found=on_opportunity_found,
+                amounts_by_mint=amounts_by_mint
             )
         
         elif mode == 'live':
@@ -570,7 +594,7 @@ async def main(mode: str = 'scan'):
                 try:
                     success_count = await trader.process_opportunity_with_retries(
                         opp.cycle,
-                        test_amount,
+                        opp.initial_amount,
                         user_pubkey,
                         max_retries=10,
                         first_attempt_use_original_opportunity=True,
@@ -599,7 +623,8 @@ async def main(mode: str = 'scan'):
                         start_token,
                         test_amount,
                         max_opportunities=100,  # High limit, callback will process immediately
-                        on_opportunity_found=on_opportunity_found
+                        on_opportunity_found=on_opportunity_found,
+                        amounts_by_mint=amounts_by_mint
                     )
                     
                     # Wait before next search iteration

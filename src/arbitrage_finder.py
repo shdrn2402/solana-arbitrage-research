@@ -4,7 +4,7 @@ Searches for cycles starting and ending in USDC (3-leg and 4-leg formats) with p
 """
 import asyncio
 import logging
-from typing import List, Optional, Tuple, Callable, Awaitable, AsyncIterator
+from typing import List, Optional, Tuple, Callable, Awaitable, AsyncIterator, Dict
 from dataclasses import dataclass
 import time
 
@@ -77,7 +77,8 @@ class ArbitrageFinder:
         start_token: str,
         amount: int,
         max_opportunities: int = 10,
-        on_opportunity_found: Optional[Callable[[ArbitrageOpportunity], Awaitable[bool]]] = None
+        on_opportunity_found: Optional[Callable[[ArbitrageOpportunity], Awaitable[bool]]] = None,
+        amounts_by_mint: Optional[Dict[str, int]] = None
     ) -> List[ArbitrageOpportunity]:
         """
         Find arbitrage opportunities starting from a token.
@@ -107,7 +108,13 @@ class ArbitrageFinder:
         
         # Check each cycle sequentially (no parallelism) with delays to avoid quota burn
         for cycle in cycles:
-            result = await self._check_cycle(cycle, amount)
+            # Use per-base-token amount if provided (SOL and USDC have different decimals/limits)
+            cycle_amount = amounts_by_mint.get(cycle[0], amount) if amounts_by_mint else amount
+            if cycle_amount <= 0:
+                # Skip cycles we cannot fund (e.g., no USDC balance)
+                continue
+
+            result = await self._check_cycle(cycle, cycle_amount)
             
             if result:
                 # Check validity and log rejection reasons at DEBUG level

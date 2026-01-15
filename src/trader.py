@@ -50,7 +50,8 @@ class Trader:
         amount: int,
         max_opportunities: int = 10,
         sol_balance: float = 0.0,
-        usdc_balance: float = 0.0
+        usdc_balance: float = 0.0,
+        amounts_by_mint: Optional[Dict[str, int]] = None
     ) -> list[ArbitrageOpportunity]:
         """Scan for arbitrage opportunities (read-only)."""
         sol_limit = sol_balance * self.risk.config.max_position_size_percent / 100
@@ -58,7 +59,10 @@ class Trader:
         logger.info(f"{colors['CYAN']}SOL scanning limits: {colors['YELLOW']}{sol_limit:.4f} SOL{colors['RESET']}")
         logger.info(f"{colors['CYAN']}USDC scanning limits: {colors['YELLOW']}{usdc_limit:.2f} USDC{colors['RESET']}")
         opportunities = await self.finder.find_opportunities(
-            start_token, amount, max_opportunities
+            start_token,
+            amount,
+            max_opportunities,
+            amounts_by_mint=amounts_by_mint
         )
         
         count = len(opportunities)
