@@ -52,7 +52,7 @@ class RiskManager:
     def update_wallet_balance(self, balance_lamports: int):
         """Update wallet balance from network."""
         self.wallet_balance = balance_lamports
-        logger.info(f"{colors['GREEN']}Wallet balance updated!{colors['RESET']}")
+        logger.info(f"{colors['DIM']}Wallet balance updated!{colors['RESET']}")
     
     def get_available_balance(self) -> int:
         """Get available balance (total - locked)."""

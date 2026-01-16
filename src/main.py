@@ -197,8 +197,8 @@ async def main(mode: str = 'scan'):
     elif max_slippage_bps_explicitly_set or slippage_bps_explicitly_set:
         # Log current configuration if at least one variable was explicitly set
         logger.info(
-            f"{colors['CYAN']}Slippage configuration:{colors['RESET']} MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
-            f"SLIPPAGE_BPS={colors['YELLOW']}{slippage_bps}{colors['RESET']}"
+            f"Slippage configuration: MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
+            f"SLIPPAGE_BPS={colors['GREEN']}{slippage_bps}{colors['RESET']}"
         )   
     
     # Load wallet
@@ -222,7 +222,7 @@ async def main(mode: str = 'scan'):
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
     if sol_price_auto and sol_price_auto > 0:
         sol_price_usdc = sol_price_auto
-        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API:{colors['RESET']} {sol_price_usdc:.2f} {colors['YELLOW']}USDC{colors['RESET']}")
+        logger.info(f"SOL price fetched from Jupiter API: {colors['GREEN']}{sol_price_usdc:.2f} {colors['CYAN']}USDC{colors['RESET']}")
         # Update risk_config with fetched price
         risk_config.sol_price_usdc = sol_price_usdc
         # Recalculate max_position_absolute_usdc with updated price
@@ -246,7 +246,7 @@ async def main(mode: str = 'scan'):
         balance = await solana.get_balance()
         risk_manager.update_wallet_balance(balance)
         sol_balance = balance / 1e9  # Convert from lamports to SOL
-        logger.info(f"{colors['CYAN']}SOL balance:{colors['RESET']} {colors['YELLOW']}{sol_balance:.4f}{colors['RESET']} SOL")
+        logger.info(f"{colors['CYAN']}SOL balance:{colors['RESET']} {colors['GREEN']}{sol_balance:.4f}{colors['RESET']} {colors['CYAN']}SOL{colors['RESET']}")
         
         # Get USDC balance
         try:
@@ -339,10 +339,10 @@ async def main(mode: str = 'scan'):
             else:
                 logger.debug("No token accounts found in result.value")
             
-            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} {usdc_balance:.2f} {colors['YELLOW']}USDC{colors['RESET']}")
+            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} {colors['GREEN']}{usdc_balance:.2f}{colors['RESET']} {colors['CYAN']}USDC{colors['RESET']}")
         except Exception as e:
             logger.warning(f"Could not retrieve USDC balance: {e}", exc_info=True)
-            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} 0.00 {colors['YELLOW']}USDC{colors['RESET']}")
+            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} {colors['GREEN']}0.00{colors['RESET']} {colors['CYAN']}USDC{colors['RESET']}")
     
     # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
     tokens_config = config.get('tokens', {})
@@ -493,22 +493,22 @@ async def main(mode: str = 'scan'):
     # Log effective runtime configuration with test_amount and cycles count
     logger.info(
         f"{colors['CYAN']}Effective config:{colors['RESET']} "
-        f"mode={colors['YELLOW']}{mode}{colors['RESET']}, "
+        f"mode={colors['CYAN']}{mode}{colors['RESET']}, "
         f"MIN_PROFIT_USDC={colors['YELLOW']}{risk_config.min_profit_usdc:.4f}{colors['RESET']}, "
-        f"MIN_PROFIT_BPS={colors['YELLOW']}{risk_config.min_profit_bps}{colors['RESET']}, "
-        f"SLIPPAGE_BPS={colors['YELLOW']}{slippage_bps}{colors['RESET']}, "
+        f"MIN_PROFIT_BPS={colors['GREEN']}{risk_config.min_profit_bps}{colors['RESET']}, "
+        f"SLIPPAGE_BPS={colors['GREEN']}{slippage_bps}{colors['RESET']}, "
         f"MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
         f"MAX_POSITION_SIZE_PERCENT={colors['YELLOW']}{risk_config.max_position_size_percent}%{colors['RESET']}, "
         f"MAX_POSITION_SIZE_ABSOLUTE_SOL={colors['YELLOW']}{max_position_absolute_sol:.4f}{colors['RESET']}, "
-        f"TEST_AMOUNT_SOL={colors['YELLOW']}{test_amount_sol/1e9:.6f}{colors['RESET']} ({colors['YELLOW']}{test_amount_sol}{colors['RESET']} lamports), "
-        f"TEST_AMOUNT_USDC={colors['YELLOW']}{test_amount_usdc/1e6:.2f}{colors['RESET']} ({colors['YELLOW']}{test_amount_usdc}{colors['RESET']} units), "
-        f"QUOTE_DELAY_SECONDS={colors['YELLOW']}{quote_delay_seconds}{colors['RESET']}, "
-        f"CYCLES={colors['YELLOW']}{len(cycles)}{colors['RESET']}"
+        f"TEST_AMOUNT_SOL={colors['GREEN']}{test_amount_sol/1e9:.6f}{colors['RESET']} ({colors['DIM']}{test_amount_sol} lamports{colors['RESET']}), "
+        f"TEST_AMOUNT_USDC={colors['GREEN']}{test_amount_usdc/1e6:.2f}{colors['RESET']} ({colors['DIM']}{test_amount_usdc} units{colors['RESET']}), "
+        f"QUOTE_DELAY_SECONDS={colors['GREEN']}{quote_delay_seconds}{colors['RESET']}, "
+        f"CYCLES={colors['GREEN']}{len(cycles)}{colors['RESET']}"
     )
     
     try:
         if mode == 'scan':
-            logger.info(f"{colors['CYAN']}Mode: {colors['GREEN']}SCAN (read-only){colors['RESET']}")
+            logger.info(f"{colors['CYAN']}Mode: {colors['CYAN']}SCAN (read-only){colors['RESET']}")
             usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
             sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
             logger.info(f"Optimized scan: cycles={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
@@ -543,7 +543,7 @@ async def main(mode: str = 'scan'):
                 logger.info(f"{colors['RED']}No profitable opportunities found{colors['RESET']}")
         
         elif mode == 'simulate':
-            logger.info(f"{colors['CYAN']}Mode: {colors['YELLOW']}SIMULATE{colors['RESET']}")
+            logger.info(f"{colors['CYAN']}Mode: {colors['CYAN']}SIMULATE{colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for simulation")
                 return
@@ -554,7 +554,7 @@ async def main(mode: str = 'scan'):
             async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
                 """Process opportunity immediately with retries (burst mode for fast processing)."""
                 cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
-                logger.info(f"{colors['GREEN']}Found opportunity: {cycle_display}{colors['RESET']}")
+                logger.info(f"Found opportunity: {colors['CYAN']}{cycle_display}{colors['RESET']}")
                 
                 # Use burst mode for fast processing (recheck, swap, simulate, execute)
                 async with jupiter.rate_limiter.burst():
@@ -568,7 +568,7 @@ async def main(mode: str = 'scan'):
                     )
                 
                 if success_count > 0:
-                    logger.info(f"{colors['GREEN']}Processed {success_count} successful simulations{colors['RESET']}")
+                    logger.info(f"Processed {colors['GREEN']}{success_count}{colors['RESET']} successful simulations")
                 
                 # Continue searching for more opportunities
                 return True
@@ -583,7 +583,7 @@ async def main(mode: str = 'scan'):
             )
         
         elif mode == 'live':
-            logger.info(f"{colors['CYAN']}Mode: {colors['RED']}LIVE (real trading){colors['RESET']}")
+            logger.info(f"{colors['CYAN']}Mode: {colors['CYAN']}LIVE (real trading){colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for live trading")
                 return
@@ -619,7 +619,7 @@ async def main(mode: str = 'scan'):
                         )
                     
                     if success_count > 0:
-                        logger.info(f"{colors['GREEN']}Processed {success_count} successful executions{colors['RESET']}")
+                        logger.info(f"Processed {colors['GREEN']}{success_count}{colors['RESET']} successful executions")
                     # If success_count == 0, it was already logged in process_opportunity_with_retries
                 except Exception as e:
                     logger.error(f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}", exc_info=True)
@@ -662,7 +662,7 @@ async def main(mode: str = 'scan'):
         # Cleanup
         await jupiter.close()
         await solana.close()
-        logger.info(f"{colors['YELLOW']}Bot stopped{colors['RESET']}")
+        logger.info(f"{colors['DIM']}Bot stopped{colors['RESET']}")
 
 
 if __name__ == '__main__':

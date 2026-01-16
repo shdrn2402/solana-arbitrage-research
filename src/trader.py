@@ -100,7 +100,7 @@ class Trader:
             Number of successful executions
         """
         cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
-        logger.info(f"{colors['CYAN']}Processing opportunity with retries:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (mode: {self.mode})")
+        logger.info(f"Processing opportunity with retries: {colors['CYAN']}{cycle_display}{colors['RESET']} (mode: {colors['CYAN']}{self.mode}{colors['RESET']})")
         success_count = 0
         timestamp_start = time.monotonic()
         
@@ -123,7 +123,7 @@ class Trader:
                     # Opportunity no longer profitable, stop retrying
                     if success_count > 0:
                         # Already had successful executions, opportunity just became unprofitable
-                        logger.info(f"{colors['YELLOW']}Opportunity {cycle_display} no longer profitable after {success_count} successful executions{colors['RESET']}")
+                        logger.info(f"Opportunity {colors['CYAN']}{cycle_display}{colors['RESET']} {colors['YELLOW']}no longer profitable{colors['RESET']} after {colors['GREEN']}{success_count}{colors['RESET']} successful executions")
                     else:
                         # Dropped before first execution - this is the "died before execution" case
                         logger.info(f"{colors['RED']}Opportunity dropped before execution (recheck not profitable):{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} (recheck: {recheck_duration_ms:.1f}ms)")
@@ -152,11 +152,18 @@ class Trader:
                     initial_display = self._format_amount(opportunity.initial_amount, start_token)
                     final_display = self._format_amount(opportunity.final_amount, start_token)
                     
+                    # Parse initial_display and final_display to colorize numbers and tickers separately
+                    # Format: "X.XX TOKEN" -> number GREEN, ticker CYAN
+                    initial_parts = initial_display.split()
+                    final_parts = final_display.split()
+                    initial_colored = f"{colors['GREEN']}{initial_parts[0]}{colors['RESET']} {colors['CYAN']}{initial_parts[1] if len(initial_parts) > 1 else ''}{colors['RESET']}"
+                    final_colored = f"{colors['GREEN']}{final_parts[0]}{colors['RESET']} {colors['CYAN']}{final_parts[1] if len(final_parts) > 1 else ''}{colors['RESET']}"
+                    
                     logger.info(
-                        f"{colors['GREEN']}Simulation #{success_count} successful for cycle: {cycle_display} | "
-                        f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
-                        f"Initial: {initial_display} | "
-                        f"Final: {final_display}{colors['RESET']}"
+                        f"Simulation #{colors['GREEN']}{success_count}{colors['RESET']} successful for cycle: {colors['CYAN']}{cycle_display}{colors['RESET']} | "
+                        f"Profit: {colors['YELLOW']}{opportunity.profit_bps} bps{colors['RESET']} ({colors['YELLOW']}${opportunity.profit_usd:.4f}{colors['RESET']}) | "
+                        f"Initial: {initial_colored} | "
+                        f"Final: {final_colored}"
                     )
                     # Continue to next retry
                 else:
@@ -175,12 +182,18 @@ class Trader:
                     initial_display = self._format_amount(opportunity.initial_amount, start_token)
                     final_display = self._format_amount(opportunity.final_amount, start_token)
                     
+                    # Parse initial_display and final_display to colorize numbers and tickers separately
+                    initial_parts = initial_display.split()
+                    final_parts = final_display.split()
+                    initial_colored = f"{colors['GREEN']}{initial_parts[0]}{colors['RESET']} {colors['CYAN']}{initial_parts[1] if len(initial_parts) > 1 else ''}{colors['RESET']}"
+                    final_colored = f"{colors['GREEN']}{final_parts[0]}{colors['RESET']} {colors['CYAN']}{final_parts[1] if len(final_parts) > 1 else ''}{colors['RESET']}"
+                    
                     logger.info(
-                        f"{colors['GREEN']}Execution #{success_count} successful: {colors['CYAN']}{tx_sig}{colors['RESET']} | "
-                        f"Cycle: {cycle_display} | "
-                        f"Profit: {opportunity.profit_bps} bps (${opportunity.profit_usd:.4f}) | "
-                        f"Initial: {initial_display} | "
-                        f"Final: {final_display}"
+                        f"Execution #{colors['GREEN']}{success_count}{colors['RESET']} successful: {colors['CYAN']}{tx_sig}{colors['RESET']} | "
+                        f"Cycle: {colors['CYAN']}{cycle_display}{colors['RESET']} | "
+                        f"Profit: {colors['YELLOW']}{opportunity.profit_bps} bps{colors['RESET']} ({colors['YELLOW']}${opportunity.profit_usd:.4f}{colors['RESET']}) | "
+                        f"Initial: {initial_colored} | "
+                        f"Final: {final_colored}"
                     )
                     # Continue to next retry
                 else:
@@ -254,7 +267,7 @@ class Trader:
             (success: bool, error_message: Optional[str], simulation_result: Optional[Dict], swap_response: Optional[JupiterSwapResponse])
         """
         cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
-        logger.info(f"{colors['CYAN']}Simulating opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}")
+        logger.info(f"Simulating opportunity: {colors['CYAN']}{cycle_display}{colors['RESET']}")
         
         # Build swap transaction for the full cycle
         # Note: Jupiter doesn't support multi-leg swaps directly,

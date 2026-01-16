@@ -9,8 +9,10 @@ from dataclasses import dataclass
 import time
 
 from .jupiter_client import JupiterClient, JupiterQuote
+from .utils import get_terminal_colors
 
 logger = logging.getLogger(__name__)
+colors = get_terminal_colors()
 
 
 @dataclass
@@ -100,7 +102,7 @@ class ArbitrageFinder:
             logger.warning("No cycles configured. Please add cycles to config.json")
             return []
         
-        logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities...")
+        logger.info(f"{colors['DIM']}Searching {len(cycles)} cycles for arbitrage opportunities...{colors['RESET']}")
         if on_opportunity_found:
             logger.debug("Callback on_opportunity_found is provided, will call it for each profitable opportunity")
         else:
@@ -159,10 +161,10 @@ class ArbitrageFinder:
 
                     # If callback provided, call it immediately (processing will pause the search loop)
                     if on_opportunity_found:
-                        logger.info("Calling on_opportunity_found callback...")
+                        logger.info(f"{colors['DIM']}Calling on_opportunity_found callback...{colors['RESET']}")
                         try:
                             should_continue = await on_opportunity_found(result)
-                            logger.info(f"Callback finished, should_continue={should_continue}")
+                            logger.info(f"{colors['DIM']}Callback finished, should_continue={should_continue}{colors['RESET']}")
                         except Exception as e:
                             logger.error(f"Error in on_opportunity_found callback: {e}", exc_info=True)
                             should_continue = True  # Continue on error to avoid blocking
@@ -208,7 +210,7 @@ class ArbitrageFinder:
         # Use cycles from config.json (already in mint-address form)
         cycles = self.cycles
         
-        logger.info(f"Searching {len(cycles)} cycles for arbitrage opportunities (stream mode)...")
+        logger.info(f"{colors['DIM']}Searching {len(cycles)} cycles for arbitrage opportunities (stream mode)...{colors['RESET']}")
         
         for cycle in cycles:
             result = await self._check_cycle(cycle, amount)
