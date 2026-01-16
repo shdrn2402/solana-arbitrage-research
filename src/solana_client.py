@@ -5,11 +5,13 @@ import asyncio
 import base58
 import base64
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
+from solders.hash import Hash
 from solders.rpc.responses import GetBalanceResp
 from solders.transaction import Transaction, VersionedTransaction
+from solders.address_lookup_table_account import AddressLookupTableAccount
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed, Processed
 from solana.rpc.types import TxOpts
@@ -143,6 +145,95 @@ class SolanaClient:
             logger.error(f"Error simulating transaction: {e}")
             return None
     
+    async def simulate_versioned_transaction(
+        self,
+        tx: VersionedTransaction,
+        commitment: str = "confirmed"
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Simulate a VersionedTransaction.
+        
+        Args:
+            tx: VersionedTransaction object (already signed)
+            commitment: Commitment level
+        
+        Returns:
+            Simulation result dict with err, logs, accounts, units_consumed, return_data, or None
+        """
+        try:
+            # Simulate VersionedTransaction directly
+            result = await self.client.simulate_transaction(
+                tx,
+                commitment=commitment
+            )
+            
+            # Always return simulation result dict, even on error
+            # This allows higher-level code to access logs for debugging
+            sim_result = {
+                "err": result.value.err,
+                "logs": result.value.logs or [],
+                "accounts": result.value.accounts,
+                "units_consumed": result.value.units_consumed,
+                "return_data": result.value.return_data
+            }
+            
+            if result.value.err:
+                # Log concise warning with error code (full logs will be printed by caller)
+                logger.warning(f"Simulation error: {result.value.err}")
+            
+            return sim_result
+            
+        except Exception as e:
+            logger.error(f"Error simulating VersionedTransaction: {e}")
+            return None
+    
+    async def send_versioned_transaction(
+        self,
+        tx: VersionedTransaction,
+        skip_preflight: bool = True,
+        max_retries: int = 3
+    ) -> Optional[str]:
+        """
+        Send a VersionedTransaction.
+        
+        Args:
+            tx: VersionedTransaction object (already signed)
+            skip_preflight: Skip preflight checks (default: True, since we simulate before sending)
+            max_retries: Maximum retries on failure
+        
+        Returns:
+            Transaction signature (base58 string) if successful, None otherwise
+        """
+        try:
+            # Transaction is already signed, just send it
+            for attempt in range(max_retries):
+                try:
+                    opts = TxOpts(
+                        skip_preflight=skip_preflight,
+                        max_retries=0
+                    )
+                    result = await self.client.send_transaction(tx, opts=opts)
+                    
+                    if result.value:
+                        sig = str(result.value)
+                        logger.debug(f"Transaction sent: {sig}")
+                        return sig
+                    else:
+                        logger.warning(f"Transaction send returned no signature (attempt {attempt + 1})")
+                        
+                except Exception as e:
+                    logger.warning(f"Transaction send attempt {attempt + 1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.5)
+                    else:
+                        raise
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error sending VersionedTransaction: {e}")
+            return None
+    
     async def send_transaction(
         self,
         transaction_base64: str,
@@ -264,6 +355,63 @@ class SolanaClient:
         except Exception as e:
             logger.error(f"Error confirming transaction: {e}")
             return False
+    
+    async def get_address_lookup_table_accounts(
+        self,
+        addresses: List[str]
+    ) -> List[AddressLookupTableAccount]:
+        """
+        Get Address Lookup Table (ALT) accounts from Solana RPC.
+        
+        Args:
+            addresses: List of ALT addresses (base58 strings)
+        
+        Returns:
+            List of AddressLookupTableAccount objects
+        
+        Raises:
+            Exception: If any ALT account cannot be loaded
+        """
+        if not addresses:
+            return []
+        
+        alt_accounts = []
+        for alt_address in addresses:
+            try:
+                pubkey = Pubkey.from_string(alt_address)
+                # Get account info for ALT
+                account_info = await self.client.get_account_info(pubkey, commitment=Confirmed)
+                
+                if account_info.value is None:
+                    raise ValueError(f"ALT account {alt_address} not found")
+                
+                # Parse ALT account data
+                # ALT account data format: [version, deactivation_slot, last_extended_slot, last_extended_slot_start_index, authority, padding, addresses...]
+                alt_account = AddressLookupTableAccount.from_bytes(account_info.value.data)
+                alt_accounts.append(alt_account)
+                
+                logger.debug(f"Loaded ALT account: {alt_address} with {len(alt_account.addresses)} addresses")
+            except Exception as e:
+                logger.error(f"Failed to load ALT account {alt_address}: {e}")
+                raise ValueError(f"Cannot load ALT account {alt_address}: {e}") from e
+        
+        return alt_accounts
+    
+    async def get_recent_blockhash(self) -> Optional[Hash]:
+        """
+        Get recent blockhash for transaction building.
+        
+        Returns:
+            Recent blockhash as Hash object, or None if failed
+        """
+        try:
+            result = await self.client.get_latest_blockhash(commitment=Confirmed)
+            if result.value:
+                return result.value.blockhash  # Already a Hash object
+            return None
+        except Exception as e:
+            logger.error(f"Error getting recent blockhash: {e}")
+            return None
     
     async def close(self):
         """Close RPC client."""

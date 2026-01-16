@@ -102,6 +102,33 @@ class JupiterSwapResponse:
     priority_fee_lamports: Optional[int] = None
 
 
+@dataclass
+class SwapAccountMeta:
+    """Account metadata for swap instruction."""
+    pubkey: str
+    is_signer: bool
+    is_writable: bool
+
+
+@dataclass
+class SwapInstruction:
+    """Single swap instruction from Jupiter API."""
+    program_id: str
+    accounts: List[SwapAccountMeta]
+    data: str
+
+
+@dataclass
+class JupiterSwapInstructionsResponse:
+    """Swap instructions response from Jupiter API."""
+    setup_instructions: List[SwapInstruction]
+    swap_instruction: SwapInstruction
+    cleanup_instruction: Optional[SwapInstruction]
+    address_lookup_tables: List[str]  # ALT addresses
+    last_valid_block_height: int
+    priority_fee_lamports: Optional[int] = None
+
+
 class JupiterClient:
     """Client for Jupiter Aggregator API with deterministic fallback."""
     
@@ -170,6 +197,7 @@ class JupiterClient:
         self.client = httpx.AsyncClient(timeout=timeout, headers=headers)
         self._tried_endpoints = set()  # Track endpoints already tried (DNS/401 failures)
         self._working_endpoint = None  # Cache working endpoint
+        self._working_swap_endpoint = None  # Separate cache for swap instructions endpoint
     
     async def _try_get_quote_from_endpoint(
         self,
@@ -485,6 +513,312 @@ class JupiterClient:
             except Exception as e:
                 logger.error(f"Error building swap transaction: {e}")
                 return None
+    
+    def _parse_accounts(self, accounts_data: Union[List[str], List[Dict[str, Any]]]) -> List[SwapAccountMeta]:
+        """
+        Parse accounts from Jupiter API response.
+        
+        Supports two formats:
+        1) List of strings: ["pubkey1", "pubkey2", ...] - raises NotImplementedError
+        2) List of objects: [{"pubkey": "...", "isSigner": bool, "isWritable": bool}, ...] - expected format
+        
+        Args:
+            accounts_data: Accounts data from API (list of strings or list of dicts)
+        
+        Returns:
+            List of SwapAccountMeta objects
+        
+        Raises:
+            NotImplementedError: If accounts are in string format (missing meta flags)
+        """
+        if not accounts_data:
+            return []
+        
+        # Check format: if first element is a string, it's the old format
+        if isinstance(accounts_data[0], str):
+            raise NotImplementedError(
+                "Accounts are in string format (missing isSigner/isWritable flags). "
+                "Cannot build Solana Instruction objects. "
+                "Jupiter API must return accounts with metadata."
+            )
+        
+        # Parse list of objects with metadata
+        parsed_accounts = []
+        for account_data in accounts_data:
+            if isinstance(account_data, dict):
+                parsed_accounts.append(SwapAccountMeta(
+                    pubkey=account_data.get("pubkey", ""),
+                    is_signer=account_data.get("isSigner", False),
+                    is_writable=account_data.get("isWritable", False)
+                ))
+            else:
+                # Unexpected format
+                raise ValueError(f"Unexpected account format: {type(account_data)}")
+        
+        return parsed_accounts
+    
+    def _get_swap_endpoints_to_try(self) -> List[str]:
+        """
+        Get list of endpoints to try for swap instructions, in order of preference.
+        
+        Returns:
+            List of endpoint URLs to try
+        """
+        endpoints_to_try = []
+        
+        # 1) Try working swap endpoint if cached
+        if self._working_swap_endpoint:
+            endpoints_to_try.append(self._working_swap_endpoint)
+        
+        # 2) Try working endpoint (from quote endpoint)
+        if self._working_endpoint and self._working_endpoint not in endpoints_to_try:
+            endpoints_to_try.append(self._working_endpoint)
+        
+        # 3) Try explicit api_url if set and not already in list
+        if self.api_url and self.api_url not in endpoints_to_try:
+            endpoints_to_try.append(self.api_url)
+        
+        # 4) Try fallback endpoints (swap-capable)
+        # api.jup.ag often works for swap even without key
+        swap_capable_endpoints = []
+        if self.api_key:
+            # If we have API key, prefer authenticated endpoints
+            swap_capable_endpoints.extend(self.AUTH_ENDPOINTS)
+        else:
+            # Try public endpoints first, then authenticated (some work without key)
+            swap_capable_endpoints.extend(self.PUBLIC_ENDPOINTS)
+            swap_capable_endpoints.extend(self.AUTH_ENDPOINTS)
+        
+        for endpoint in swap_capable_endpoints:
+            if endpoint not in endpoints_to_try:
+                endpoints_to_try.append(endpoint)
+        
+        return endpoints_to_try
+    
+    async def get_swap_instructions(
+        self,
+        quote: JupiterQuote,
+        user_public_key: str,
+        priority_fee_lamports: int = 0,
+        wrap_unwrap_sol: bool = True,
+        dynamic_compute_unit_limit: bool = True,
+        dynamic_slippage: Optional[Dict[str, Any]] = None,
+        slippage_bps: int = 50
+    ) -> Optional[JupiterSwapInstructionsResponse]:
+        """
+        Get swap instructions from Jupiter API (for building atomic VersionedTransaction).
+        
+        This method returns structured instructions instead of a pre-built transaction,
+        allowing for atomic multi-leg transaction assembly.
+        
+        Args:
+            quote: JupiterQuote object
+            user_public_key: User's public key (base58)
+            priority_fee_lamports: Priority fee in lamports
+            wrap_unwrap_sol: Auto wrap/unwrap SOL
+            dynamic_compute_unit_limit: Use dynamic compute unit limit
+            dynamic_slippage: Dynamic slippage configuration
+            slippage_bps: Slippage in basis points (default: 50)
+        
+        Returns:
+            JupiterSwapInstructionsResponse with instructions and ALT addresses, or None if failed
+        
+        Raises:
+            NotImplementedError: If Jupiter API doesn't support instructions-only endpoint
+        """
+        # Build payload similar to get_swap_transaction, but request instructions only
+        payload = {
+            "quoteResponse": {
+                "inputMint": quote.input_mint,
+                "inAmount": str(quote.in_amount),
+                "outputMint": quote.output_mint,
+                "outAmount": str(quote.out_amount),
+                "otherAmountThreshold": str(quote.out_amount),
+                "swapMode": "ExactIn",
+                "slippageBps": slippage_bps,
+                "priceImpactPct": quote.price_impact_pct,
+                "routePlan": quote.route_plan
+            },
+            "userPublicKey": user_public_key,
+            "wrapUnwrapSOL": wrap_unwrap_sol,
+            "dynamicComputeUnitLimit": dynamic_compute_unit_limit,
+            # Request instructions instead of full transaction
+            "onlyLegs": True  # This parameter requests instructions only
+        }
+        
+        # Add priority fee if specified
+        if priority_fee_lamports > 0:
+            payload["priorityLevelWithMaxLamports"] = {
+                "maxLamports": priority_fee_lamports
+            }
+        
+        # Add dynamic slippage if specified
+        if dynamic_slippage:
+            payload["dynamicSlippage"] = dynamic_slippage
+        
+        # Get list of endpoints to try
+        endpoints_to_try = self._get_swap_endpoints_to_try()
+        if not endpoints_to_try:
+            logger.error("No Jupiter API endpoint available for swap instructions")
+            return None
+        
+        # Try each endpoint in order
+        for endpoint in endpoints_to_try:
+            # Retry on 429 with exponential backoff
+            for attempt in range(self.max_retries_on_429 + 1):
+                try:
+                    # Apply rate limiting before each HTTP POST (including retries and endpoint switches)
+                    await self.rate_limiter.acquire()
+                    
+                    # Try /swap/v1/swap endpoint with onlyLegs parameter
+                    base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
+                    swap_url = f"{base_url}/swap/v1/swap"
+                    response = await self.client.post(swap_url, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+                    
+                    # Check if response contains instructions (not just swapTransaction)
+                    if "swapTransaction" in data and "swapInstruction" not in data:
+                        # Endpoint doesn't support instructions-only mode - try next endpoint
+                        logger.debug(
+                            f"Endpoint {endpoint} does not support instructions-only mode "
+                            "(response contains swapTransaction but not instructions). Trying next endpoint."
+                        )
+                        raise NotImplementedError(
+                            "Jupiter API endpoint does not support instructions-only mode. "
+                            "Cannot build atomic multi-leg transactions."
+                        )
+                    
+                    # Parse instructions from response
+                    # Expected format (if supported):
+                    # {
+                    #   "setupInstructions": [...],
+                    #   "swapInstruction": {...},
+                    #   "cleanupInstruction": {...},
+                    #   "addressLookupTables": [...],
+                    #   "lastValidBlockHeight": ...
+                    # }
+                    
+                    last_valid_block_height = data.get("lastValidBlockHeight", 0)
+                    if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
+                        logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
+                    
+                    # Parse setup instructions
+                    setup_instructions = []
+                    if "setupInstructions" in data:
+                        for instr_data in data["setupInstructions"]:
+                            accounts = self._parse_accounts(instr_data.get("accounts", []))
+                            setup_instructions.append(SwapInstruction(
+                                program_id=instr_data.get("programId", ""),
+                                accounts=accounts,
+                                data=instr_data.get("data", "")
+                            ))
+                    
+                    # Parse swap instruction
+                    if "swapInstruction" not in data:
+                        logger.error("swapInstruction not found in Jupiter API response")
+                        raise NotImplementedError("Jupiter API response missing swapInstruction field")
+                    
+                    swap_instr_data = data["swapInstruction"]
+                    swap_accounts = self._parse_accounts(swap_instr_data.get("accounts", []))
+                    swap_instruction = SwapInstruction(
+                        program_id=swap_instr_data.get("programId", ""),
+                        accounts=swap_accounts,
+                        data=swap_instr_data.get("data", "")
+                    )
+                    
+                    # Parse cleanup instruction (optional)
+                    cleanup_instruction = None
+                    if "cleanupInstruction" in data and data["cleanupInstruction"]:
+                        cleanup_instr_data = data["cleanupInstruction"]
+                        cleanup_accounts = self._parse_accounts(cleanup_instr_data.get("accounts", []))
+                        cleanup_instruction = SwapInstruction(
+                            program_id=cleanup_instr_data.get("programId", ""),
+                            accounts=cleanup_accounts,
+                            data=cleanup_instr_data.get("data", "")
+                        )
+                    
+                    # Parse address lookup tables
+                    address_lookup_tables = data.get("addressLookupTables", [])
+                    
+                    instructions_response = JupiterSwapInstructionsResponse(
+                        setup_instructions=setup_instructions,
+                        swap_instruction=swap_instruction,
+                        cleanup_instruction=cleanup_instruction,
+                        address_lookup_tables=address_lookup_tables,
+                        last_valid_block_height=last_valid_block_height,
+                        priority_fee_lamports=priority_fee_lamports
+                    )
+                    
+                    # Cache successful endpoint
+                    self._working_swap_endpoint = endpoint
+                    
+                    logger.debug(
+                        f"Swap instructions received from {endpoint}: {len(setup_instructions)} setup, "
+                        f"1 swap, {1 if cleanup_instruction else 0} cleanup, "
+                        f"{len(address_lookup_tables)} ALTs, "
+                        f"last_valid_block_height: {last_valid_block_height}"
+                    )
+                    return instructions_response
+                    
+                except NotImplementedError:
+                    # Endpoint doesn't support instructions - try next endpoint (don't mark as tried)
+                    logger.debug(f"Endpoint {endpoint} doesn't support instructions-only mode, trying next endpoint")
+                    break  # Break out of retry loop, continue to next endpoint
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401:
+                        # Unauthorized - mark endpoint as tried and continue to next
+                        logger.debug(f"Endpoint {endpoint} returned 401 (unauthorized), trying next endpoint")
+                        self._tried_endpoints.add(endpoint)
+                        break  # Break out of retry loop, continue to next endpoint
+                    elif e.response.status_code == 429:
+                        # Rate limit exceeded - retry with backoff
+                        if attempt < self.max_retries_on_429:
+                            # Check for Retry-After header
+                            retry_after = e.response.headers.get("Retry-After")
+                            if retry_after:
+                                try:
+                                    wait_time = float(retry_after)
+                                except ValueError:
+                                    wait_time = self.backoff_base_seconds * (2 ** attempt)
+                            else:
+                                # Exponential backoff
+                                wait_time = min(
+                                    self.backoff_base_seconds * (2 ** attempt),
+                                    self.backoff_max_seconds
+                                )
+                            
+                            logger.warning(
+                                f"Rate limit exceeded (429) for swap instructions from {endpoint}, "
+                                f"retrying in {wait_time:.1f}s (attempt {attempt + 1}/{self.max_retries_on_429})"
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            # Max retries reached - try next endpoint
+                            logger.error(f"Rate limit exceeded (429) for swap instructions from {endpoint} after {self.max_retries_on_429} retries, trying next endpoint")
+                            break  # Break out of retry loop, continue to next endpoint
+                    
+                    # Check if endpoint doesn't support instructions-only mode (400 with specific error)
+                    if e.response.status_code == 400:
+                        error_text = e.response.text.lower()
+                        if "onlylegs" in error_text or "instructions" in error_text:
+                            logger.debug(
+                                f"Endpoint {endpoint} does not support instructions-only mode: {e.response.status_code} - {e.response.text}. Trying next endpoint."
+                            )
+                            break  # Break out of retry loop, continue to next endpoint
+                    
+                    # Other HTTP errors - try next endpoint
+                    logger.debug(f"Endpoint {endpoint} returned {e.response.status_code}, trying next endpoint")
+                    break  # Break out of retry loop, continue to next endpoint
+                except Exception as e:
+                    # Network/parse errors - try next endpoint
+                    logger.debug(f"Error with endpoint {endpoint}: {e}, trying next endpoint")
+                    break  # Break out of retry loop, continue to next endpoint
+        
+        # All endpoints failed
+        logger.error("All Jupiter API endpoints failed for swap instructions")
+        return None
     
     async def get_sol_price_usdc(
         self,

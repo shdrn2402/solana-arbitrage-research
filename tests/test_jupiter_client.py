@@ -4,7 +4,14 @@ Tests for jupiter_client.py
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
-from src.jupiter_client import JupiterClient, JupiterQuote, JupiterSwapResponse
+from src.jupiter_client import (
+    JupiterClient,
+    JupiterQuote,
+    JupiterSwapResponse,
+    JupiterSwapInstructionsResponse,
+    SwapInstruction,
+    SwapAccountMeta
+)
 
 
 class TestJupiterClient:
@@ -279,6 +286,306 @@ class TestJupiterClient:
             tokens = await client.get_tokens()
             
             assert tokens is None
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_success(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions returns instructions response on success."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [
+                {
+                    "programId": "11111111111111111111111111111111",
+                    "accounts": [
+                        {"pubkey": "account1", "isSigner": True, "isWritable": True},
+                        {"pubkey": "account2", "isSigner": False, "isWritable": False}
+                    ],
+                    "data": "setup_data"
+                }
+            ],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True},
+                    {"pubkey": "swap_account2", "isSigner": False, "isWritable": True},
+                    {"pubkey": "swap_account3", "isSigner": False, "isWritable": False}
+                ],
+                "data": "swap_data"
+            },
+            "cleanupInstruction": {
+                "programId": "11111111111111111111111111111111",
+                "accounts": [
+                    {"pubkey": "cleanup_account1", "isSigner": False, "isWritable": True}
+                ],
+                "data": "cleanup_data"
+            },
+            "addressLookupTables": [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222"
+            ],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(
+                quote,
+                "user_pubkey",
+                priority_fee_lamports=10000,
+                slippage_bps=50
+            )
+            
+            assert instructions_response is not None
+            assert isinstance(instructions_response, JupiterSwapInstructionsResponse)
+            assert len(instructions_response.setup_instructions) == 1
+            assert instructions_response.setup_instructions[0].program_id == "11111111111111111111111111111111"
+            assert len(instructions_response.setup_instructions[0].accounts) == 2
+            assert isinstance(instructions_response.setup_instructions[0].accounts[0], SwapAccountMeta)
+            assert instructions_response.setup_instructions[0].accounts[0].pubkey == "account1"
+            assert instructions_response.setup_instructions[0].accounts[0].is_signer is True
+            assert instructions_response.setup_instructions[0].accounts[0].is_writable is True
+            assert instructions_response.setup_instructions[0].accounts[1].pubkey == "account2"
+            assert instructions_response.setup_instructions[0].accounts[1].is_signer is False
+            assert instructions_response.setup_instructions[0].accounts[1].is_writable is False
+            assert instructions_response.setup_instructions[0].data == "setup_data"
+            
+            assert instructions_response.swap_instruction.program_id == "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+            assert len(instructions_response.swap_instruction.accounts) == 3
+            assert isinstance(instructions_response.swap_instruction.accounts[0], SwapAccountMeta)
+            assert instructions_response.swap_instruction.accounts[0].pubkey == "swap_account1"
+            assert instructions_response.swap_instruction.accounts[0].is_signer is True
+            assert instructions_response.swap_instruction.accounts[0].is_writable is True
+            assert instructions_response.swap_instruction.accounts[1].pubkey == "swap_account2"
+            assert instructions_response.swap_instruction.accounts[1].is_signer is False
+            assert instructions_response.swap_instruction.accounts[1].is_writable is True
+            assert instructions_response.swap_instruction.accounts[2].pubkey == "swap_account3"
+            assert instructions_response.swap_instruction.accounts[2].is_signer is False
+            assert instructions_response.swap_instruction.accounts[2].is_writable is False
+            assert instructions_response.swap_instruction.data == "swap_data"
+            
+            assert instructions_response.cleanup_instruction is not None
+            assert instructions_response.cleanup_instruction.program_id == "11111111111111111111111111111111"
+            assert len(instructions_response.cleanup_instruction.accounts) == 1
+            assert instructions_response.cleanup_instruction.accounts[0].pubkey == "cleanup_account1"
+            assert instructions_response.cleanup_instruction.accounts[0].is_signer is False
+            assert instructions_response.cleanup_instruction.accounts[0].is_writable is True
+            
+            assert len(instructions_response.address_lookup_tables) == 2
+            assert instructions_response.address_lookup_tables[0] == "ALT1Address1111111111111111111111111111111"
+            assert instructions_response.address_lookup_tables[1] == "ALT2Address2222222222222222222222222222222"
+            
+            assert instructions_response.last_valid_block_height == 12345
+            assert instructions_response.priority_fee_lamports == 10000
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_no_cleanup(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions handles missing cleanup instruction."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTables": [],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(
+                quote,
+                "user_pubkey"
+            )
+            
+            assert instructions_response is not None
+            assert len(instructions_response.setup_instructions) == 0
+            assert instructions_response.cleanup_instruction is None
+            assert instructions_response.swap_instruction is not None
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_not_implemented(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions tries next endpoint when API doesn't support instructions."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        # First endpoint returns swapTransaction but no instructions (old API version)
+        mock_response1 = MagicMock()
+        mock_response1.json.return_value = {
+            "swapTransaction": "base64_encoded_tx",
+            "lastValidBlockHeight": 12345
+        }
+        mock_response1.raise_for_status = MagicMock()
+        
+        # Second endpoint returns proper instructions
+        mock_response2 = MagicMock()
+        mock_response2.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTables": [],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response2.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', side_effect=[mock_response1, mock_response2]):
+            client._working_endpoint = "https://api.jup.ag"
+            client.fallback_endpoints = ["https://api.jup.ag", "https://quote-api.jup.ag/v6"]
+            
+            instructions_response = await client.get_swap_instructions(quote, "user_pubkey")
+            
+            # Should succeed with second endpoint
+            assert instructions_response is not None
+            assert instructions_response.swap_instruction.program_id == "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_400_error(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions tries next endpoint on 400 with instructions error."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        # First endpoint returns 400
+        mock_response1 = MagicMock()
+        mock_response1.status_code = 400
+        mock_response1.text = "onlyLegs parameter not supported"
+        
+        http_error1 = httpx.HTTPStatusError(
+            "400 Bad Request",
+            request=MagicMock(),
+            response=mock_response1
+        )
+        
+        # Second endpoint returns proper instructions
+        mock_response2 = MagicMock()
+        mock_response2.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTables": [],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response2.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', side_effect=[http_error1, mock_response2]):
+            client._working_endpoint = "https://api.jup.ag"
+            client.fallback_endpoints = ["https://api.jup.ag", "https://quote-api.jup.ag/v6"]
+            
+            instructions_response = await client.get_swap_instructions(quote, "user_pubkey")
+            
+            # Should succeed with second endpoint
+            assert instructions_response is not None
+            assert instructions_response.swap_instruction.program_id == "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_failure(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions returns None on general failure."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+        
+        http_error = httpx.HTTPStatusError(
+            "500 Internal Server Error",
+            request=MagicMock(),
+            response=mock_response
+        )
+        
+        with patch.object(client.client, 'post', side_effect=http_error):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(quote, "user_pubkey")
+            
+            assert instructions_response is None
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_string_accounts_format(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions raises NotImplementedError when accounts are in string format."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        # API returns accounts as strings (old format without metadata)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": ["swap_account1", "swap_account2"],  # String format (old)
+                "data": "swap_data"
+            },
+            "addressLookupTables": [],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            # Should try next endpoint, but if all endpoints return string format, should fail
+            # For this test, we'll make it fail on first endpoint and check the error
+            instructions_response = await client.get_swap_instructions(quote, "user_pubkey")
+            
+            # Should return None because parsing failed (accounts in string format)
+            assert instructions_response is None
     
     @pytest.mark.asyncio
     async def test_close(self, client):

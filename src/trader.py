@@ -5,9 +5,25 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Optional, Dict, Any, Tuple, List
+import base64
+import hashlib
+from typing import Optional, Dict, Any, Tuple, List, Set
 
-from .jupiter_client import JupiterClient, JupiterSwapResponse
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.hash import Hash
+from solders.instruction import Instruction, AccountMeta
+from solders.message import MessageV0
+from solders.transaction import VersionedTransaction
+from solders.address_lookup_table_account import AddressLookupTableAccount
+
+from .jupiter_client import (
+    JupiterClient,
+    JupiterSwapResponse,
+    JupiterSwapInstructionsResponse,
+    SwapInstruction,
+    SwapAccountMeta
+)
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
 from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
@@ -56,8 +72,8 @@ class Trader:
         """Scan for arbitrage opportunities (read-only)."""
         sol_limit = sol_balance * self.risk.config.max_position_size_percent / 100
         usdc_limit = usdc_balance * self.risk.config.max_position_size_percent / 100
-        logger.info(f"{colors['CYAN']}SOL scanning limits: {colors['YELLOW']}{sol_limit:.4f} SOL{colors['RESET']}")
-        logger.info(f"{colors['CYAN']}USDC scanning limits: {colors['YELLOW']}{usdc_limit:.2f} USDC{colors['RESET']}")
+        logger.info(f"SOL scanning limits: {colors['GREEN']}{sol_limit:.4f} {colors['CYAN']}SOL{colors['RESET']}")
+        logger.info(f"USDC scanning limits: {colors['GREEN']}{usdc_limit:.2f} {colors['CYAN']}USDC{colors['RESET']}")
         opportunities = await self.finder.find_opportunities(
             start_token,
             amount,
@@ -267,17 +283,55 @@ class Trader:
             (success: bool, error_message: Optional[str], simulation_result: Optional[Dict], swap_response: Optional[JupiterSwapResponse])
         """
         cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
-        logger.info(f"Simulating opportunity: {colors['CYAN']}{cycle_display}{colors['RESET']}")
+        legs_count = len(opportunity.quotes)
         
-        # Build swap transaction for the full cycle
-        # Note: Jupiter doesn't support multi-leg swaps directly,
-        # so we'd need to build a transaction with multiple swaps
-        # For now, we simulate the first leg as a proxy
+        logger.info(
+            f"Simulating opportunity: {colors['CYAN']}{cycle_display}{colors['RESET']} "
+            f"({colors['GREEN']}{legs_count}{colors['RESET']} leg{'s' if legs_count != 1 else ''})"
+        )
         
         if not opportunity.quotes:
             return False, "No quotes available", None, None
         
-        # Get swap transaction for first leg
+        # Use atomic VT for multi-leg cycles (len(quotes) > 1)
+        if len(opportunity.quotes) > 1:
+            # Build atomic VersionedTransaction
+            vt, min_last_valid_block_height = await self._build_atomic_cycle_vt(opportunity, user_pubkey)
+            
+            if vt is None:
+                return False, "Failed to build atomic VersionedTransaction", None, None
+            
+            # Log VT details
+            logger.debug(
+                f"Atomic VT built: {colors['GREEN']}{len(vt.message.instructions)}{colors['RESET']} instructions, "
+                f"{colors['GREEN']}{len(vt.message.address_table_lookups)}{colors['RESET']} ALT lookups, "
+                f"message_type: {colors['CYAN']}v0{colors['RESET']}, "
+                f"last_valid_block_height: {colors['YELLOW']}{min_last_valid_block_height or 0}{colors['RESET']}"
+            )
+            
+            # Simulate atomic VT
+            sim_result = await self.solana.simulate_versioned_transaction(vt)
+            
+            if sim_result is None:
+                return False, "Simulation failed (no result from RPC)", None, None
+            
+            # Be defensive: RPC client should return a dict
+            if not isinstance(sim_result, dict):
+                return False, f"Simulation failed (invalid result type: {type(sim_result).__name__})", None, None
+            
+            if sim_result.get("err"):
+                # Include simulation logs in error message for debugging
+                err_msg = f"Simulation error: {sim_result['err']}"
+                logs = sim_result.get("logs", [])
+                if logs:
+                    log_tail = self._format_sim_logs(logs, tail=20)
+                    err_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+                return False, err_msg, sim_result, None
+            
+            return True, None, sim_result, None
+        
+        # Single-leg path: use old method for backward compatibility
+        # (Could also use atomic VT, but keeping old path for now)
         first_quote = opportunity.quotes[0]
         swap_response = await self.jupiter.get_swap_transaction(
             first_quote,
@@ -336,20 +390,31 @@ class Trader:
         if self.trade_in_progress:
             return False, "Another trade is already in progress. Wait for completion.", None
         
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        legs_count = len(opportunity.quotes) if opportunity.quotes else 0
+        
+        if not opportunity.quotes:
+            logger.warning(f"Refusing execution: no quotes available (cycle: {cycle_display})")
+            return False, "No quotes available", None
+        
         position_id = str(uuid.uuid4())
         
-        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
-        logger.info(f"{colors['CYAN']}Executing opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}")
+        logger.info(
+            f"{colors['CYAN']}Executing opportunity:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']} "
+            f"({colors['GREEN']}{legs_count}{colors['RESET']} leg{'s' if legs_count != 1 else ''})"
+        )
         logger.info(f"{colors['CYAN']}Position ID:{colors['RESET']} {colors['YELLOW']}{position_id}{colors['RESET']}")
         
         # Set trade_in_progress flag BEFORE any operations
         self.trade_in_progress = True
         
         try:
-            # Risk check
+            # A) Risk check (token-aware: base_mint is first token in cycle)
+            base_mint = opportunity.cycle[0]
             can_open, reason = self.risk.can_open_position(
-                opportunity.initial_amount,
-                opportunity.profit_bps,
+                base_mint=base_mint,
+                amount_in=opportunity.initial_amount,
+                expected_profit_bps=opportunity.profit_bps,
                 slippage_bps=self.slippage_bps,  # from config
                 expected_profit_usdc=opportunity.profit_usd  # Note: profit_usd is actually USDC
             )
@@ -357,82 +422,74 @@ class Trader:
             if not can_open:
                 return False, f"Risk check failed: {reason}", None
             
-            # Add position
+            # Add position (base_mint is first token in cycle)
             self.risk.add_position(
                 position_id,
-                opportunity.cycle[0],
-                opportunity.cycle[-1],
+                opportunity.cycle[0],  # input_mint
+                opportunity.cycle[-1],  # output_mint
                 opportunity.initial_amount,
-                opportunity.final_amount
+                opportunity.final_amount,
+                base_mint=base_mint  # base token for balance locking
             )
             
-            # MANDATORY SIMULATION: No transaction can be sent without successful simulation
-            # Reuse swap_response from simulation to avoid duplicate Jupiter API call
-            sim_success, sim_error, sim_result, swap_response = await self.simulate_opportunity(
-                opportunity, user_pubkey
+            # B) Build atomic VersionedTransaction
+            vt, min_last_valid_block_height = await self._build_atomic_cycle_vt(opportunity, user_pubkey)
+            
+            if vt is None:
+                return False, "Failed to build atomic VersionedTransaction", None
+            
+            # Log VT details
+            logger.debug(
+                f"Atomic VT built: {colors['GREEN']}{len(vt.message.instructions)}{colors['RESET']} instructions, "
+                f"{colors['GREEN']}{len(vt.message.address_table_lookups)}{colors['RESET']} ALT lookups, "
+                f"message_type: {colors['CYAN']}v0{colors['RESET']}, "
+                f"last_valid_block_height: {colors['YELLOW']}{min_last_valid_block_height or 0}{colors['RESET']}"
             )
             
-            if not sim_success:
-                # sim_error already includes logs if available
-                error_msg = f"Simulation failed (MANDATORY): {sim_error}"
-                # If sim_result has logs but they weren't included in sim_error, add them
-                if sim_result and sim_result.get("logs") and "Simulation logs" not in sim_error:
-                    log_tail = self._format_sim_logs(sim_result.get("logs", []), tail=20)
-                    error_msg += f"\nSimulation logs (last 20):\n{log_tail}"
-                return False, error_msg, None
+            # C) Mandatory simulation of atomic VT
+            sim_result = await self.solana.simulate_versioned_transaction(vt)
             
-            if swap_response is None:
-                return False, "No swap transaction from simulation", None
+            if sim_result is None:
+                return False, "Simulation failed (no result from RPC)", None
             
-            # Validate simulation result
-            # Note: Simulation only executes the first leg of the cycle (see simulate_opportunity method)
-            # Therefore, we validate only the first leg output, not the full cycle
-            first_quote = opportunity.quotes[0]
-            expected_first_leg_output = first_quote.out_amount
-            # TODO: Extract actual output from sim_result logs or accounts for full validation
-            # For now, using expected value as proxy (simplified validation of first leg only)
-            actual_first_leg_output = first_quote.out_amount  # placeholder - should extract from sim_result
+            if not isinstance(sim_result, dict):
+                return False, f"Simulation failed (invalid result type: {type(sim_result).__name__})", None
             
-            is_valid, reason = self.risk.validate_simulation_result(
-                expected_first_leg_output,
-                actual_first_leg_output,
-                max_deviation_bps=100
-            )
+            if sim_result.get("err"):
+                # Include simulation logs in error message for debugging
+                err_msg = f"Simulation failed (MANDATORY): {sim_result['err']}"
+                logs = sim_result.get("logs", [])
+                if logs:
+                    log_tail = self._format_sim_logs(logs, tail=20)
+                    err_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+                return False, err_msg, None
             
-            if not is_valid:
-                return False, f"Simulation validation failed: {reason}", None
-            
-            # Security checks before sending transaction
-            
-            # Check 1: Validate quote expiry (lastValidBlockHeight)
+            # D) Quote expiry check using min_last_valid_block_height from VT
             current_block_height = await self.solana.get_current_block_height()
             if current_block_height is None:
                 logger.warning("Failed to get current block height for quote expiry check, proceeding anyway")
             else:
-                if swap_response.last_valid_block_height > 0:
-                    if current_block_height >= swap_response.last_valid_block_height:
+                if min_last_valid_block_height and min_last_valid_block_height > 0:
+                    if current_block_height >= min_last_valid_block_height:
                         error_msg = (
                             f"Quote expired: current block height {current_block_height} "
-                            f">= last valid block height {swap_response.last_valid_block_height}"
+                            f">= last valid block height {min_last_valid_block_height}"
                         )
                         logger.warning(error_msg)
                         return False, error_msg, None
                     else:
                         logger.debug(
                             f"Quote valid: current block height {current_block_height} "
-                            f"< last valid block height {swap_response.last_valid_block_height}"
+                            f"< last valid block height {min_last_valid_block_height}"
                         )
                 else:
                     logger.warning("Quote has no last_valid_block_height set (0), skipping expiry check")
             
-            # Balance check is already done in can_open_position() before add_position()
-            # Removing duplicate check here to avoid false "Insufficient balance" after add_position() locks funds
-            
-            # Send transaction (only in 'live' mode, already checked above)
+            # E) Send atomic VersionedTransaction
             # Use skip_preflight=True since we already have mandatory simulation
             self.risk.update_position_status(position_id, 'executing')
-            tx_sig = await self.solana.send_transaction(
-                swap_response.swap_transaction,
+            tx_sig = await self.solana.send_versioned_transaction(
+                vt,
                 skip_preflight=True
             )
             
@@ -444,7 +501,6 @@ class Trader:
             
             if confirmed:
                 self.risk.update_position_status(position_id, 'completed')
-                logger.info(f"Transaction confirmed: {tx_sig}")
                 return True, None, tx_sig
             else:
                 self.risk.update_position_status(position_id, 'failed')
@@ -487,3 +543,290 @@ class Trader:
             # Update position status to failed on error
             if position_id in self.risk.active_positions:
                 self.risk.update_position_status(position_id, 'failed')
+    
+    def _swap_instruction_to_solana_instruction(self, swap_instr: SwapInstruction) -> Instruction:
+        """
+        Convert SwapInstruction from Jupiter API to Solana Instruction.
+        
+        Args:
+            swap_instr: SwapInstruction from Jupiter API
+        
+        Returns:
+            Solana Instruction object
+        """
+        program_id = Pubkey.from_string(swap_instr.program_id)
+        
+        # Convert accounts
+        accounts = []
+        for account_meta in swap_instr.accounts:
+            pubkey = Pubkey.from_string(account_meta.pubkey)
+            accounts.append(AccountMeta(
+                pubkey=pubkey,
+                is_signer=account_meta.is_signer,
+                is_writable=account_meta.is_writable
+            ))
+        
+        # Decode data from base64
+        try:
+            data = base64.b64decode(swap_instr.data)
+        except Exception as e:
+            raise ValueError(f"Failed to decode instruction data from base64: {e}") from e
+        
+        return Instruction(
+            program_id=program_id,
+            accounts=accounts,
+            data=data
+        )
+    
+    def _instruction_signature(self, instruction: Instruction) -> str:
+        """
+        Generate a signature for an instruction to detect duplicates.
+        
+        Args:
+            instruction: Solana Instruction
+        
+        Returns:
+            Hash signature string
+        """
+        # Create signature from program_id, accounts (pubkey + flags), and data
+        sig_parts = [str(instruction.program_id)]
+        for account in instruction.accounts:
+            sig_parts.append(f"{account.pubkey}:{account.is_signer}:{account.is_writable}")
+        sig_parts.append(base64.b64encode(instruction.data).decode('utf-8'))
+        
+        sig_string = "|".join(sig_parts)
+        return hashlib.sha256(sig_string.encode()).hexdigest()
+    
+    def _deduplicate_instructions(
+        self,
+        instructions: List[Instruction]
+    ) -> List[Instruction]:
+        """
+        Deduplicate instructions by signature (program_id, accounts, data).
+        
+        Args:
+            instructions: List of instructions
+        
+        Returns:
+            Deduplicated list of instructions (preserving order, keeping first occurrence)
+        """
+        seen = set()
+        deduplicated = []
+        
+        for instr in instructions:
+            sig = self._instruction_signature(instr)
+            if sig not in seen:
+                seen.add(sig)
+                deduplicated.append(instr)
+        
+        return deduplicated
+    
+    async def _build_atomic_cycle_vt(
+        self,
+        opportunity: ArbitrageOpportunity,
+        user_pubkey: str
+    ) -> Tuple[Optional[VersionedTransaction], Optional[int]]:
+        """
+        Build atomic VersionedTransaction for 3-leg cycle (all-or-nothing execution).
+        
+        Args:
+            opportunity: ArbitrageOpportunity with 3-leg cycle
+            user_pubkey: User's public key (base58)
+        
+        Returns:
+            Tuple of (VersionedTransaction ready to sign and send, min_last_valid_block_height) or (None, None) if build failed
+        """
+        # Validate cycle length (must be 3-leg: 4 tokens, 3 quotes)
+        if len(opportunity.cycle) != 4:
+            logger.error(
+                f"Invalid cycle length for atomic transaction: {len(opportunity.cycle)} "
+                f"(expected 4 for 3-leg cycle)"
+            )
+            return None
+        
+        if len(opportunity.quotes) != 3:
+            logger.error(
+                f"Invalid quotes count for atomic transaction: {len(opportunity.quotes)} "
+                f"(expected 3 for 3-leg cycle)"
+            )
+            return None
+        
+        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr[:8]) for addr in opportunity.cycle)
+        logger.debug(
+            f"Building atomic VersionedTransaction for cycle: {colors['CYAN']}{cycle_display}{colors['RESET']}"
+        )
+        
+        # Get instructions for each leg
+        leg_instructions: List[JupiterSwapInstructionsResponse] = []
+        all_alt_addresses: Set[str] = set()
+        last_valid_block_heights: List[int] = []
+        
+        for i, quote in enumerate(opportunity.quotes):
+            try:
+                instructions_resp = await self.jupiter.get_swap_instructions(
+                    quote=quote,
+                    user_public_key=user_pubkey,
+                    priority_fee_lamports=self.priority_fee,
+                    wrap_unwrap_sol=True,
+                    dynamic_compute_unit_limit=True,
+                    slippage_bps=self.slippage_bps
+                )
+                
+                if instructions_resp is None:
+                    logger.error(f"Failed to get swap instructions for leg {i+1}")
+                    return None
+                
+                leg_instructions.append(instructions_resp)
+                all_alt_addresses.update(instructions_resp.address_lookup_tables)
+                last_valid_block_heights.append(instructions_resp.last_valid_block_height)
+                
+                logger.debug(
+                    f"Leg {i+1}: {len(instructions_resp.setup_instructions)} setup, "
+                    f"1 swap, {1 if instructions_resp.cleanup_instruction else 0} cleanup, "
+                    f"{len(instructions_resp.address_lookup_tables)} ALTs"
+                )
+            except NotImplementedError as e:
+                logger.error(f"Leg {i+1} failed: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Error getting instructions for leg {i+1}: {e}", exc_info=True)
+                return None
+        
+        # Calculate minimum last_valid_block_height (most restrictive)
+        min_last_valid_block_height = min(last_valid_block_heights) if last_valid_block_heights else 0
+        logger.debug(f"Using minimum last_valid_block_height: {colors['YELLOW']}{min_last_valid_block_height}{colors['RESET']}")
+        
+        # Load ALT accounts
+        alt_accounts: List[AddressLookupTableAccount] = []
+        if all_alt_addresses:
+            try:
+                alt_accounts = await self.solana.get_address_lookup_table_accounts(
+                    list(all_alt_addresses)
+                )
+                logger.debug(f"Loaded {colors['GREEN']}{len(alt_accounts)}{colors['RESET']} ALT accounts")
+            except Exception as e:
+                logger.error(f"Failed to load ALT accounts: {e}")
+                return None
+        
+        # Build instruction list in order:
+        # A) ComputeBudget (if needed - skip for now, Jupiter handles it)
+        # B) Setup instructions (all legs, deduplicated)
+        # C) Swap instructions (leg1 -> leg2 -> leg3)
+        # D) Cleanup instructions (all legs, deduplicated)
+        
+        all_setup_instructions: List[Instruction] = []
+        swap_instructions: List[Instruction] = []
+        all_cleanup_instructions: List[Instruction] = []
+        
+        # Collect setup and cleanup from all legs
+        for leg_resp in leg_instructions:
+            for setup_instr in leg_resp.setup_instructions:
+                all_setup_instructions.append(
+                    self._swap_instruction_to_solana_instruction(setup_instr)
+                )
+            
+            swap_instructions.append(
+                self._swap_instruction_to_solana_instruction(leg_resp.swap_instruction)
+            )
+            
+            if leg_resp.cleanup_instruction:
+                all_cleanup_instructions.append(
+                    self._swap_instruction_to_solana_instruction(leg_resp.cleanup_instruction)
+                )
+        
+        # Deduplicate setup and cleanup
+        setup_instructions = self._deduplicate_instructions(all_setup_instructions)
+        cleanup_instructions = self._deduplicate_instructions(all_cleanup_instructions)
+        
+        logger.debug(
+            f"Instruction counts: {colors['GREEN']}{len(setup_instructions)}{colors['RESET']} setup "
+            f"(deduped from {len(all_setup_instructions)}), "
+            f"{colors['GREEN']}{len(swap_instructions)}{colors['RESET']} swap, "
+            f"{colors['GREEN']}{len(cleanup_instructions)}{colors['RESET']} cleanup "
+            f"(deduped from {len(all_cleanup_instructions)})"
+        )
+        
+        # Combine all instructions in order
+        all_instructions = setup_instructions + swap_instructions + cleanup_instructions
+        
+        if not all_instructions:
+            logger.error("No instructions to build transaction")
+            return None
+        
+        # Get recent blockhash
+        recent_blockhash = await self.solana.get_recent_blockhash()
+        if not recent_blockhash:
+            logger.error("Failed to get recent blockhash")
+            return None
+        
+        # Get wallet pubkey
+        if self.solana.wallet is None:
+            logger.error("No wallet available for transaction signing")
+            return None
+        
+        payer = self.solana.wallet.pubkey()
+        
+        # Build MessageV0 with ALT using try_compile
+        try:
+            # MessageV0.try_compile() automatically:
+            # - Collects account keys from instructions (preserving order, handling duplicates)
+            # - Creates proper MessageHeader
+            # - Handles address_table_lookups from ALT accounts
+            # - Returns proper MessageV0 (not legacy Message)
+            message_v0 = MessageV0.try_compile(
+                payer=payer,
+                instructions=all_instructions,
+                address_lookup_table_accounts=alt_accounts,
+                recent_blockhash=recent_blockhash
+            )
+            
+            # Validate that we got MessageV0 (not legacy)
+            if not isinstance(message_v0, MessageV0):
+                logger.error(f"Expected MessageV0, got {type(message_v0)}")
+                return None
+            
+            # Create VersionedTransaction from MessageV0
+            # VersionedTransaction(message, signatures)
+            # Signatures will be empty initially, we'll sign after creation
+            versioned_tx = VersionedTransaction(message_v0, [])
+            
+            # Sign transaction with wallet
+            # VersionedTransaction.sign() expects a list of signers
+            versioned_tx.sign([self.solana.wallet])
+            
+            # Log transaction details
+            logger.info(
+                f"{colors['GREEN']}Atomic VersionedTransaction built (v0):{colors['RESET']} "
+                f"{colors['GREEN']}{len(all_instructions)}{colors['RESET']} instructions, "
+                f"{colors['GREEN']}{len(alt_accounts)}{colors['RESET']} ALTs, "
+                f"message_type: {colors['CYAN']}v0{colors['RESET']}, "
+                f"last_valid_block_height: {colors['YELLOW']}{min_last_valid_block_height}{colors['RESET']}"
+            )
+            
+            # Log ALT details if present
+            if alt_accounts:
+                alt_addresses = [str(alt.addresses[0]) if alt.addresses else "empty" for alt in alt_accounts]
+                logger.debug(
+                    f"ALT accounts used: {colors['CYAN']}{len(alt_accounts)}{colors['RESET']} "
+                    f"(address_table_lookups: {len(message_v0.address_table_lookups)})"
+                )
+            
+            return versioned_tx, min_last_valid_block_height
+            
+        except Exception as e:
+            logger.error(
+                f"Failed to build VersionedTransaction (v0): {e}",
+                exc_info=True
+            )
+            # Check for specific error types
+            if "too many accounts" in str(e).lower() or "account" in str(e).lower():
+                logger.error(
+                    f"Transaction too large: {len(all_instructions)} instructions, "
+                    f"{len(alt_accounts)} ALTs. Consider reducing instruction count."
+                )
+            elif "alt" in str(e).lower() or "lookup" in str(e).lower():
+                logger.error(
+                    f"ALT loading/compilation failed. "
+                    f"ALT accounts: {len(alt_accounts)}, addresses: {list(all_alt_addresses)}"
+                )
+            return None, None
