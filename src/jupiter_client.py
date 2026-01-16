@@ -3,11 +3,82 @@ Jupiter API Client for quotes and swap transactions.
 """
 import httpx
 import time
+import asyncio
 from typing import Dict, List, Optional, Any, Tuple, Union
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+class RateLimiter:
+    """
+    Token bucket rate limiter for Jupiter API requests.
+    
+    Ensures strict rate limiting: 1 request per second by default.
+    Supports burst mode for fast processing of opportunities.
+    """
+    
+    def __init__(self, requests_per_second: float = 1.0):
+        """
+        Initialize rate limiter.
+        
+        Args:
+            requests_per_second: Maximum requests per second (default: 1.0)
+        """
+        self.requests_per_second = requests_per_second
+        self.min_interval = 1.0 / requests_per_second if requests_per_second > 0 else 0.0
+        self._last_request_time = 0.0
+        self._burst_mode = False
+        self._lock = asyncio.Lock()
+    
+    async def acquire(self):
+        """
+        Wait until a request can be made (respecting rate limit).
+        
+        In burst mode, this returns immediately without waiting.
+        """
+        async with self._lock:
+            if self._burst_mode:
+                # Burst mode: no rate limiting
+                return
+            
+            current_time = time.monotonic()
+            time_since_last = current_time - self._last_request_time
+            
+            if time_since_last < self.min_interval:
+                wait_time = self.min_interval - time_since_last
+                await asyncio.sleep(wait_time)
+            
+            self._last_request_time = time.monotonic()
+    
+    @asynccontextmanager
+    async def burst(self):
+        """
+        Context manager for burst mode (temporarily disable rate limiting).
+        
+        Usage:
+            async with limiter.burst():
+                # All requests here bypass rate limiting
+                await make_requests()
+        """
+        async with self._lock:
+            old_burst = self._burst_mode
+            self._burst_mode = True
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._burst_mode = old_burst
+    
+    def pause(self):
+        """Temporarily pause rate limiting (enter burst mode)."""
+        self._burst_mode = True
+    
+    def resume(self):
+        """Resume rate limiting (exit burst mode)."""
+        self._burst_mode = False
 
 
 @dataclass
@@ -46,7 +117,16 @@ class JupiterClient:
         # Add alternative authenticated endpoints here if available
     ]
     
-    def __init__(self, api_url: Optional[str] = None, api_key: Optional[str] = None, timeout: float = 10.0):
+    def __init__(
+        self,
+        api_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        timeout: float = 10.0,
+        requests_per_second: float = 1.0,
+        max_retries_on_429: int = 3,
+        backoff_base_seconds: float = 1.0,
+        backoff_max_seconds: float = 30.0
+    ):
         """
         Initialize Jupiter API client.
         
@@ -54,6 +134,10 @@ class JupiterClient:
             api_url: Explicit API URL (overrides fallback). If None, uses fallback list.
             api_key: Jupiter API key for authenticated requests. If provided, will be used in headers.
             timeout: Request timeout in seconds.
+            requests_per_second: Rate limit for Jupiter API requests (default: 1.0 req/sec)
+            max_retries_on_429: Maximum retries on 429 rate limit error (default: 3)
+            backoff_base_seconds: Base backoff time for 429 retries (default: 1.0)
+            backoff_max_seconds: Maximum backoff time for 429 retries (default: 30.0)
         """
         if api_url:
             # Explicit URL provided - use it directly (no fallback)
@@ -70,6 +154,12 @@ class JupiterClient:
         
         self.api_key = api_key
         self.timeout = timeout
+        
+        # Rate limiting
+        self.rate_limiter = RateLimiter(requests_per_second=requests_per_second)
+        self.max_retries_on_429 = max_retries_on_429
+        self.backoff_base_seconds = backoff_base_seconds
+        self.backoff_max_seconds = backoff_max_seconds
         
         # Setup HTTP client with headers if API key is provided
         headers = {}
@@ -96,72 +186,105 @@ class JupiterClient:
             - '401': Unauthorized (endpoint requires auth, don't retry)
             - 'other': Other error (don't retry)
         """
+        # Apply rate limiting (unless in burst mode)
+        await self.rate_limiter.acquire()
+        
         # Use correct endpoint path: /swap/v1/quote (current working Jupiter API endpoint)
         # Remove any trailing /v6 or /v1 from endpoint base URL
         base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
         url = f"{base_url}/swap/v1/quote"
         start_time = time.time()
         
-        try:
-            response = await self.client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-            
-            time_taken = time.time() - start_time
-            
-            quote = JupiterQuote(
-                input_mint=data.get("inputMint", params["inputMint"]),
-                output_mint=data.get("outputMint", params["outputMint"]),
-                in_amount=int(data.get("inAmount", params["amount"])),
-                out_amount=int(data.get("outAmount", 0)),
-                price_impact_pct=float(data.get("priceImpactPct", 0)),
-                route_plan=data.get("routePlan", []),
-                context_slot=data.get("contextSlot"),
-                time_taken=time_taken
-            )
-            
-            # Cache working endpoint
-            self._working_endpoint = endpoint
-            logger.debug(f"Quote from {endpoint}: {params['inputMint'][:8]}... -> {params['outputMint'][:8]}... "
-                        f"in={quote.in_amount} out={quote.out_amount} "
-                        f"impact={quote.price_impact_pct:.2f}%")
-            
-            return quote, None
-            
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                # 401 = endpoint requires auth
-                if self.api_key:
-                    # We have API key but still got 401 - key might be invalid
-                    self._tried_endpoints.add(endpoint)
-                    logger.error(f"Endpoint {endpoint} returned 401 even with API key. Key may be invalid.")
-                    return None, '401'
-                else:
-                    # No API key - mark as tried and don't retry (for scan mode without key)
-                    self._tried_endpoints.add(endpoint)
-                    logger.warning(f"Endpoint {endpoint} requires authentication (401). No API key provided.")
-                    return None, '401'
-            elif e.response.status_code == 404:
-                # 404 = route not found (no route available for this pair)
-                # This is a valid API response, not a transport error - don't mark endpoint as failed
-                logger.debug(f"Route not found for {params.get('inputMint', '')[:8]}... -> {params.get('outputMint', '')[:8]}... (404)")
-                return None, '404'
-            else:
-                # Other HTTP errors - don't retry this endpoint
-                self._tried_endpoints.add(endpoint)
-                logger.warning(f"Jupiter quote failed from {endpoint}: {e.response.status_code} - {e.response.text}")
-                return None, 'other'
+        # Retry on 429 with exponential backoff
+        for attempt in range(self.max_retries_on_429 + 1):
+            try:
+                response = await self.client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
                 
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
-            # DNS/network error - can try next endpoint
-            logger.debug(f"Connection error for {endpoint} (DNS/network): {e}. Will try next endpoint if available.")
-            return None, 'dns'
-            
-        except Exception as e:
-            # Unexpected error - don't retry
-            self._tried_endpoints.add(endpoint)
-            logger.error(f"Unexpected error getting quote from {endpoint}: {e}")
-            return None, 'other'
+                time_taken = time.time() - start_time
+                
+                quote = JupiterQuote(
+                    input_mint=data.get("inputMint", params["inputMint"]),
+                    output_mint=data.get("outputMint", params["outputMint"]),
+                    in_amount=int(data.get("inAmount", params["amount"])),
+                    out_amount=int(data.get("outAmount", 0)),
+                    price_impact_pct=float(data.get("priceImpactPct", 0)),
+                    route_plan=data.get("routePlan", []),
+                    context_slot=data.get("contextSlot"),
+                    time_taken=time_taken
+                )
+                
+                # Cache working endpoint
+                self._working_endpoint = endpoint
+                logger.debug(f"Quote from {endpoint}: {params['inputMint'][:8]}... -> {params['outputMint'][:8]}... "
+                            f"in={quote.in_amount} out={quote.out_amount} "
+                            f"impact={quote.price_impact_pct:.2f}%")
+                
+                return quote, None
+                
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    # Rate limit exceeded - retry with backoff
+                    if attempt < self.max_retries_on_429:
+                        # Check for Retry-After header
+                        retry_after = e.response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait_time = float(retry_after)
+                            except ValueError:
+                                wait_time = self.backoff_base_seconds * (2 ** attempt)
+                        else:
+                            # Exponential backoff
+                            wait_time = min(
+                                self.backoff_base_seconds * (2 ** attempt),
+                                self.backoff_max_seconds
+                            )
+                        
+                        logger.warning(
+                            f"Rate limit exceeded (429) from {endpoint}, "
+                            f"retrying in {wait_time:.1f}s (attempt {attempt + 1}/{self.max_retries_on_429})"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        # Max retries reached - don't mark endpoint as dead (429 is temporary)
+                        logger.error(f"Rate limit exceeded (429) from {endpoint} after {self.max_retries_on_429} retries")
+                        return None, '429'
+                
+                if e.response.status_code == 401:
+                    # 401 = endpoint requires auth
+                    if self.api_key:
+                        # We have API key but still got 401 - key might be invalid
+                        self._tried_endpoints.add(endpoint)
+                        logger.error(f"Endpoint {endpoint} returned 401 even with API key. Key may be invalid.")
+                        return None, '401'
+                    else:
+                        # No API key - mark as tried and don't retry (for scan mode without key)
+                        self._tried_endpoints.add(endpoint)
+                        logger.warning(f"Endpoint {endpoint} requires authentication (401). No API key provided.")
+                        return None, '401'
+                elif e.response.status_code == 404:
+                    # 404 = route not found (no route available for this pair)
+                    # This is a valid API response, not a transport error - don't mark endpoint as failed
+                    logger.debug(f"Route not found for {params.get('inputMint', '')[:8]}... -> {params.get('outputMint', '')[:8]}... (404)")
+                    return None, '404'
+                else:
+                    # Other HTTP errors - don't retry this endpoint
+                    self._tried_endpoints.add(endpoint)
+                    logger.warning(f"Jupiter quote failed from {endpoint}: {e.response.status_code} - {e.response.text}")
+                    return None, 'other'
+                    
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
+                # DNS/network error - can try next endpoint
+                logger.debug(f"Connection error for {endpoint} (DNS/network): {e}. Will try next endpoint if available.")
+                return None, 'dns'
+                
+            except Exception as e:
+                # Unexpected error - don't retry
+                self._tried_endpoints.add(endpoint)
+                logger.error(f"Unexpected error getting quote from {endpoint}: {e}")
+                return None, 'other'
     
     async def get_quote(
         self,
@@ -296,39 +419,72 @@ class JupiterClient:
         if dynamic_slippage:
             payload["dynamicSlippage"] = dynamic_slippage
         
+        # Apply rate limiting (unless in burst mode)
+        await self.rate_limiter.acquire()
+        
         # Use working endpoint if available, otherwise use explicit api_url
         endpoint = self._working_endpoint or self.api_url
         if not endpoint:
             logger.error("No Jupiter API endpoint available for swap")
             return None
         
-        try:
-            # Use correct endpoint path: /swap/v1/swap
-            base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
-            swap_url = f"{base_url}/swap/v1/swap"
-            response = await self.client.post(swap_url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            
-            last_valid_block_height = data.get("lastValidBlockHeight", 0)
-            if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
-                logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
-            
-            swap_response = JupiterSwapResponse(
-                swap_transaction=data.get("swapTransaction", ""),
-                last_valid_block_height=last_valid_block_height,
-                priority_fee_lamports=priority_fee_lamports
-            )
-            
-            logger.debug(f"Swap transaction built: {len(swap_response.swap_transaction)} bytes, last_valid_block_height: {swap_response.last_valid_block_height}")
-            return swap_response
-            
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Jupiter swap transaction failed: {e.response.status_code} - {e.response.text}")
-            return None
-        except Exception as e:
-            logger.error(f"Error building swap transaction: {e}")
-            return None
+        # Retry on 429 with exponential backoff
+        for attempt in range(self.max_retries_on_429 + 1):
+            try:
+                # Use correct endpoint path: /swap/v1/swap
+                base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
+                swap_url = f"{base_url}/swap/v1/swap"
+                response = await self.client.post(swap_url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                
+                last_valid_block_height = data.get("lastValidBlockHeight", 0)
+                if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
+                    logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
+                
+                swap_response = JupiterSwapResponse(
+                    swap_transaction=data.get("swapTransaction", ""),
+                    last_valid_block_height=last_valid_block_height,
+                    priority_fee_lamports=priority_fee_lamports
+                )
+                
+                logger.debug(f"Swap transaction built: {len(swap_response.swap_transaction)} bytes, last_valid_block_height: {swap_response.last_valid_block_height}")
+                return swap_response
+                
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    # Rate limit exceeded - retry with backoff
+                    if attempt < self.max_retries_on_429:
+                        # Check for Retry-After header
+                        retry_after = e.response.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait_time = float(retry_after)
+                            except ValueError:
+                                wait_time = self.backoff_base_seconds * (2 ** attempt)
+                        else:
+                            # Exponential backoff
+                            wait_time = min(
+                                self.backoff_base_seconds * (2 ** attempt),
+                                self.backoff_max_seconds
+                            )
+                        
+                        logger.warning(
+                            f"Rate limit exceeded (429) for swap from {endpoint}, "
+                            f"retrying in {wait_time:.1f}s (attempt {attempt + 1}/{self.max_retries_on_429})"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        # Max retries reached
+                        logger.error(f"Rate limit exceeded (429) for swap from {endpoint} after {self.max_retries_on_429} retries")
+                        return None
+                
+                logger.error(f"Jupiter swap transaction failed: {e.response.status_code} - {e.response.text}")
+                return None
+            except Exception as e:
+                logger.error(f"Error building swap transaction: {e}")
+                return None
     
     async def get_sol_price_usdc(
         self,

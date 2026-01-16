@@ -163,7 +163,13 @@ async def main(mode: str = 'scan'):
     slippage_bps = int(slippage_bps_env) if (slippage_bps_env and slippage_bps_env.strip()) else 50
     slippage_bps_original = slippage_bps  # Сохраняем для сравнения после валидации
     diagnostic_slippage_bps = int(os.getenv('DIAGNOSTIC_SLIPPAGE_BPS', '500'))
-    quote_delay_seconds = float(os.getenv('QUOTE_DELAY_SECONDS', '1.0'))
+    quote_delay_seconds = float(os.getenv('QUOTE_DELAY_SECONDS', '1.0'))  # Deprecated, kept for backward compatibility
+    
+    # Jupiter rate limiting configuration
+    jupiter_rps = float(os.getenv('JUPITER_RPS', '1.0'))  # Requests per second (default: 1.0)
+    jupiter_max_retries_429 = int(os.getenv('JUPITER_MAX_RETRIES_ON_429', '3'))
+    jupiter_backoff_base = float(os.getenv('JUPITER_BACKOFF_BASE_SECONDS', '1.0'))
+    jupiter_backoff_max = float(os.getenv('JUPITER_BACKOFF_MAX_SECONDS', '30.0'))
     
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
     # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
@@ -191,9 +197,9 @@ async def main(mode: str = 'scan'):
     elif max_slippage_bps_explicitly_set or slippage_bps_explicitly_set:
         # Log current configuration if at least one variable was explicitly set
         logger.info(
-            f"{colors['CYAN']}Slippage configuration:{colors['RESET']} {colors['YELLOW']}MAX_SLIPPAGE_BPS={risk_config.max_slippage_bps}, "
-            f"SLIPPAGE_BPS={slippage_bps}{colors['RESET']}"
-        )
+            f"{colors['CYAN']}Slippage configuration:{colors['RESET']} MAX_SLIPPAGE_BPS={colors['YELLOW']}{risk_config.max_slippage_bps}{colors['RESET']}, "
+            f"SLIPPAGE_BPS={colors['YELLOW']}{slippage_bps}{colors['RESET']}"
+        )   
     
     # Load wallet
     wallet = load_wallet()
@@ -202,14 +208,21 @@ async def main(mode: str = 'scan'):
         return
     
     # Initialize clients
-    jupiter = JupiterClient(jupiter_api_url, api_key=jupiter_api_key)
+    jupiter = JupiterClient(
+        jupiter_api_url,
+        api_key=jupiter_api_key,
+        requests_per_second=jupiter_rps,
+        max_retries_on_429=jupiter_max_retries_429,
+        backoff_base_seconds=jupiter_backoff_base,
+        backoff_max_seconds=jupiter_backoff_max
+    )
     solana = SolanaClient(rpc_url, wallet)
     
     # Try to fetch SOL price from Jupiter API
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
     if sol_price_auto and sol_price_auto > 0:
         sol_price_usdc = sol_price_auto
-        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API: {colors['YELLOW']}{sol_price_usdc:.2f} USDC{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}SOL price fetched from Jupiter API:{colors['RESET']} {sol_price_usdc:.2f} {colors['YELLOW']}USDC{colors['RESET']}")
         # Update risk_config with fetched price
         risk_config.sol_price_usdc = sol_price_usdc
         # Recalculate max_position_absolute_usdc with updated price
@@ -233,7 +246,7 @@ async def main(mode: str = 'scan'):
         balance = await solana.get_balance()
         risk_manager.update_wallet_balance(balance)
         sol_balance = balance / 1e9  # Convert from lamports to SOL
-        logger.info(f"{colors['CYAN']}SOL balance: {colors['YELLOW']}{sol_balance:.4f} SOL{colors['RESET']}")
+        logger.info(f"{colors['CYAN']}SOL balance:{colors['RESET']} {colors['YELLOW']}{sol_balance:.4f}{colors['RESET']} SOL")
         
         # Get USDC balance
         try:
@@ -326,10 +339,10 @@ async def main(mode: str = 'scan'):
             else:
                 logger.debug("No token accounts found in result.value")
             
-            logger.info(f"{colors['CYAN']}USDC balance: {colors['YELLOW']}{usdc_balance:.2f} USDC{colors['RESET']}")
+            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} {usdc_balance:.2f} {colors['YELLOW']}USDC{colors['RESET']}")
         except Exception as e:
             logger.warning(f"Could not retrieve USDC balance: {e}", exc_info=True)
-            logger.info("USDC balance: 0.00 USDC")
+            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} 0.00 {colors['YELLOW']}USDC{colors['RESET']}")
     
     # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
     tokens_config = config.get('tokens', {})
@@ -539,18 +552,20 @@ async def main(mode: str = 'scan'):
             
             # Callback for immediate processing when opportunity is found
             async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
-                """Process opportunity immediately with retries."""
+                """Process opportunity immediately with retries (burst mode for fast processing)."""
                 cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
                 logger.info(f"{colors['GREEN']}Found opportunity: {cycle_display}{colors['RESET']}")
                 
-                success_count = await trader.process_opportunity_with_retries(
-                    opp.cycle,
-                    opp.initial_amount,
-                    user_pubkey,
-                    max_retries=10,
-                    first_attempt_use_original_opportunity=True,
-                    original_opportunity=opp
-                )
+                # Use burst mode for fast processing (recheck, swap, simulate, execute)
+                async with jupiter.rate_limiter.burst():
+                    success_count = await trader.process_opportunity_with_retries(
+                        opp.cycle,
+                        opp.initial_amount,
+                        user_pubkey,
+                        max_retries=10,
+                        first_attempt_use_original_opportunity=True,
+                        original_opportunity=opp
+                    )
                 
                 if success_count > 0:
                     logger.info(f"{colors['GREEN']}Processed {success_count} successful simulations{colors['RESET']}")
@@ -587,19 +602,21 @@ async def main(mode: str = 'scan'):
             
             # Callback for immediate processing when opportunity is found
             async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
-                """Process opportunity immediately with retries."""
+                """Process opportunity immediately with retries (burst mode for fast processing)."""
                 # Don't log "Found opportunity" here - it will be logged in process_opportunity_with_retries
                 # when actual processing starts, avoiding spam for opportunities that drop on recheck
                 
                 try:
-                    success_count = await trader.process_opportunity_with_retries(
-                        opp.cycle,
-                        opp.initial_amount,
-                        user_pubkey,
-                        max_retries=10,
-                        first_attempt_use_original_opportunity=True,
-                        original_opportunity=opp
-                    )
+                    # Use burst mode for fast processing (recheck, swap, simulate, execute)
+                    async with jupiter.rate_limiter.burst():
+                        success_count = await trader.process_opportunity_with_retries(
+                            opp.cycle,
+                            opp.initial_amount,
+                            user_pubkey,
+                            max_retries=10,
+                            first_attempt_use_original_opportunity=True,
+                            original_opportunity=opp
+                        )
                     
                     if success_count > 0:
                         logger.info(f"{colors['GREEN']}Processed {success_count} successful executions{colors['RESET']}")

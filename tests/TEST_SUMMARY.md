@@ -1,75 +1,81 @@
-# Сводка по тестам
+# Test Summary
 
-## Статистика
+## Statistics
 
-- **Всего тестовых файлов**: 6
-- **Всего тестовых функций**: ~102
-- **Асинхронных тестов**: ~54
-- **Синхронных тестов**: ~48
+- **Total test files**: 7
+- **Total test functions**: ~108
+- **Async tests**: ~55
+- **Sync tests**: ~53
 
-## Покрытие модулей
+## Module Coverage
 
-### ✅ test_risk_manager.py (~26 тестов)
-- Тесты для `RiskConfig` dataclass
-- Тесты для `RiskManager` класса
-- Проверка всех лимитов и валидаций
-- Тесты блокировки/разблокировки баланса
-- Тесты позиций
-- Валидация результатов симуляции
+### ✅ test_risk_manager.py (~26 tests)
+- Tests for `RiskConfig` dataclass
+- Tests for `RiskManager` class
+- All limits and validations checks
+- Balance lock/unlock tests
+- Position tests
+- Simulation result validation
 
-### ✅ test_arbitrage_finder.py (~17 тестов)
-- Тесты для `ArbitrageOpportunity` dataclass
-- Тесты для `ArbitrageFinder` класса
-- Проверка валидации возможностей (USDC и BPS фильтры)
-- Тесты проверки циклов
-- Тесты поиска возможностей
-- Тесты с callback функциями
+### ✅ test_arbitrage_finder.py (~17 tests)
+- Tests for `ArbitrageOpportunity` dataclass
+- Tests for `ArbitrageFinder` class
+- Opportunity validation checks (USDC and BPS filters)
+- Cycle check tests
+- Opportunity search tests
+- Tests with callback functions
 
-### ✅ test_jupiter_client.py (~15 тестов)
-- Тесты инициализации клиента
-- Тесты получения котировок (успех, ошибки, fallback)
-- Тесты построения swap транзакций
-- Тесты получения цены SOL
-- Обработка различных HTTP ошибок (404, 401, connection errors)
+### ✅ test_arbitrage_finder_negative_profit.py (~6 tests)
+- Tests for filtering unprofitable opportunities
+- Negative profit rejection tests
+- Zero profit rejection tests
+- Threshold edge case tests
 
-### ✅ test_solana_client.py (~20 тестов)
-- Тесты инициализации клиента
-- Тесты получения баланса
-- Тесты получения slot и block height
-- Тесты симуляции транзакций
-- Тесты отправки транзакций
-- Тесты подтверждения транзакций
+### ✅ test_jupiter_client.py (~15 tests)
+- Client initialization tests
+- Quote fetching tests (success, errors, fallback)
+- Swap transaction building tests
+- SOL price fetching tests
+- Various HTTP error handling (404, 401, connection errors)
 
-### ✅ test_trader.py (~21 тест)
-- Тесты инициализации в разных режимах (scan, simulate, live)
-- Тесты сканирования возможностей
-- Тесты симуляции возможностей
-- Тесты выполнения возможностей (live mode)
-- Проверка всех проверок безопасности
-- Тесты обработки ошибок
-- Тесты форматирования
+### ✅ test_solana_client.py (~20 tests)
+- Client initialization tests
+- Balance fetching tests
+- Slot and block height fetching tests
+- Transaction simulation tests
+- Transaction sending tests
+- Transaction confirmation tests
 
-### ✅ test_utils.py (~3 теста)
-- Тесты функции `get_terminal_colors`
-- Проверка работы с TTY и без TTY
+### ✅ test_trader.py (~21 tests)
+- Initialization tests in different modes (scan, simulate, live)
+- Opportunity scanning tests
+- Opportunity simulation tests
+- Opportunity execution tests (live mode)
+- All safety checks verification
+- Error handling tests
+- Formatting tests
 
-## Особенности
+### ✅ test_utils.py (~3 tests)
+- Tests for `get_terminal_colors` function
+- TTY and non-TTY operation checks
 
-1. **Все тесты используют моки** - не требуют реального подключения к сети
-2. **Асинхронные тесты** используют `@pytest.mark.asyncio`
-3. **Фикстуры** в `conftest.py` для переиспользования
-4. **Покрытие граничных случаев** и обработки ошибок
-5. **Тесты всех режимов работы** (scan, simulate, live)
+## Features
 
-## Запуск
+1. **All tests use mocks** - do not require real network connection
+2. **Async tests** use `@pytest.mark.asyncio`
+3. **Fixtures** in `conftest.py` for reuse
+4. **Edge case coverage** and error handling
+5. **Tests for all operation modes** (scan, simulate, live)
+
+## Running
 
 ```bash
-# Установить зависимости
+# Install dependencies
 pip install -r requirements.txt
 
-# Запустить все тесты
+# Run all tests
 pytest tests/ -v
 
-# Или использовать скрипт
+# Or use script
 ./run_tests.sh
 ```

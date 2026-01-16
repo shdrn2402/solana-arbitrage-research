@@ -17,9 +17,10 @@ def get_terminal_colors() -> Dict[str, str]:
     """
     use_color = sys.stdout.isatty()
     return {
-        'GREEN': '\033[92m' if use_color else '',   # For numbers/amounts
-        'CYAN': '\033[96m' if use_color else '',    # For labels/names
-        'YELLOW': '\033[93m' if use_color else '',  # For important values (prices, profits)
-        'RED': '\033[91m' if use_color else '',     # For errors/warnings
+        'GREEN': '\033[92m' if use_color else '',   # Neutral numeric values (balances, quantities, config values)
+        'CYAN': '\033[96m' if use_color else '',    # Identifiers and routes (tokens, paths, modes)
+        'YELLOW': '\033[93m' if use_color else '',  # Key economic signals (prices, profit, bps, thresholds)
+        'RED': '\033[91m' if use_color else '',     # Errors, failures, negative profit or risk violations
+        'DIM': '\033[90m' if use_color else '',     # Secondary / service messages (callbacks, start/stop, low-importance logs)
         'RESET': '\033[0m' if use_color else ''     # Reset color
     }

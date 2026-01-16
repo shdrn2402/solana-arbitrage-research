@@ -171,16 +171,12 @@ class ArbitrageFinder:
                             # Callback requested to stop searching
                             logger.info("Callback requested to stop searching")
                             break
-                        # Apply delay after callback (rate limiting per cycle)
-                        # Delay is proportional to number of quote requests in the cycle
-                        quotes_per_cycle = len(cycle) - 1
-                        await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
+                        # No delay needed after callback - rate limiting is handled by JupiterClient
+                        # Burst mode is used inside callback for fast processing
                         continue
             
-            # Delay between cycles for rate limiting (proportional to number of quote requests)
-            # This maintains ~60 req/min average while allowing burst quotes within a cycle
-            quotes_per_cycle = len(cycle) - 1
-            await asyncio.sleep(self.quote_delay_seconds * quotes_per_cycle)
+            # No delay needed between cycles - rate limiting is handled by JupiterClient
+            # Each quote request in _check_cycle() will be rate-limited individually
         
         # Sort by profit (descending)
         opportunities.sort(key=lambda x: x.profit_bps, reverse=True)
