@@ -47,7 +47,7 @@ MANIFEST
 *.spec
 
 # Unit test / coverage reports
-htmlcov/
+# (htmlcov/ moved to "Test & coverage artifacts" section below)
 .tox/
 .nox/
 .coverage
@@ -72,6 +72,9 @@ env/
 # ----------------------------------------------------------------------------
 # Logs
 # ----------------------------------------------------------------------------
+# Bot runtime logs
+arbitrage_bot.log
+simulate.log
 *.log
 *.log.*
 logs/
@@ -92,11 +95,11 @@ logs/
 # Vim
 *.swp
 *.swo
-*~
+# *~ is covered in "Temporary Files" section
 .vim/
 
 # Emacs
-*~
+# *~ is covered in "Temporary Files" section
 \#*\#
 /.emacs.desktop
 /.emacs.desktop.lock
@@ -128,7 +131,7 @@ ehthumbs_vista.db
 $RECYCLE.BIN/
 
 # Linux
-*~
+# *~ is covered in "Temporary Files" section
 .directory
 .Trash-*
 
@@ -139,8 +142,7 @@ $RECYCLE.BIN/
 *.temp
 *.bak
 *.backup
-*.swp
-*.swo
+# General backup files (editor-specific swap files are in their respective sections)
 *~
 
 # ----------------------------------------------------------------------------
@@ -157,5 +159,16 @@ local_test/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
 
-# Documentation
-TODO.md
+# ================================
+# Test & coverage artifacts
+# ================================
+# Coverage reports (generated, do not commit)
+htmlcov/
+tests/COVERAGE_REPORT.md
+.coverage
+coverage.*
+
+# Pytest cache
+.pytest_cache/
+
+# ================================

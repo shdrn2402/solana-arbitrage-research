@@ -6,8 +6,9 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Tuple
 
 import dotenv
 from solders.keypair import Keypair
@@ -75,6 +76,95 @@ def load_wallet(private_key_str: Optional[str] = None) -> Optional[Keypair]:
         return Keypair.from_bytes(key_bytes)
     except Exception as e:
         logger.error(f"Error loading wallet: {e}")
+        return None
+
+
+async def fetch_sol_lamports(solana: SolanaClient, timeout_sec: float) -> Optional[int]:
+    """Fetch SOL balance in lamports from RPC with timeout.
+    
+    Returns:
+        SOL balance in lamports, or None on error
+    """
+    try:
+        balance = await asyncio.wait_for(solana.get_balance(), timeout=timeout_sec)
+        return balance
+    except asyncio.TimeoutError:
+        logger.warning(f"SOL balance fetch timed out after {timeout_sec}s")
+        return None
+    except Exception as e:
+        logger.warning(f"Error fetching SOL balance: {e}")
+        return None
+
+
+async def fetch_usdc_units(solana: SolanaClient, wallet: Keypair, usdc_mint: str, timeout_sec: float) -> Optional[int]:
+    """Fetch USDC balance in smallest units (6 decimals) from RPC with timeout.
+    
+    Returns:
+        USDC balance in smallest units, or None on error
+    """
+    try:
+        from solana.rpc.commitment import Confirmed
+        from solana.rpc.types import TokenAccountOpts
+        from base64 import b64decode
+        import struct
+        
+        token_program_id = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+        wallet_pubkey = wallet.pubkey()
+        
+        async def _fetch():
+            result = await solana.client.get_token_accounts_by_owner(
+                wallet_pubkey,
+                TokenAccountOpts(program_id=token_program_id),
+                commitment=Confirmed
+            )
+            return result
+        
+        result = await asyncio.wait_for(_fetch(), timeout=timeout_sec)
+        
+        if result.value:
+            for account_info in result.value:
+                try:
+                    account_data = account_info.account.data
+                    
+                    # Handle different data formats
+                    account_data_bytes = None
+                    if isinstance(account_data, list) and len(account_data) > 0:
+                        account_data_bytes = b64decode(account_data[0])
+                    elif isinstance(account_data, str):
+                        account_data_bytes = b64decode(account_data)
+                    elif hasattr(account_data, '__bytes__'):
+                        account_data_bytes = bytes(account_data)
+                    elif hasattr(account_data, '__iter__') and not isinstance(account_data, (str, bytes)):
+                        try:
+                            data_list = list(account_data)
+                            if len(data_list) > 0 and isinstance(data_list[0], str):
+                                account_data_bytes = b64decode(data_list[0])
+                        except Exception:
+                            pass
+                    
+                    if account_data_bytes is None or len(account_data_bytes) < 72:
+                        continue
+                    
+                    # Extract mint (first 32 bytes)
+                    mint_bytes = account_data_bytes[0:32]
+                    mint_pubkey = Pubkey.from_bytes(mint_bytes)
+                    mint = str(mint_pubkey)
+                    
+                    # Compare with USDC mint address
+                    if mint == usdc_mint:
+                        # Extract amount (8 bytes, offset 64)
+                        amount_bytes = account_data_bytes[64:72]
+                        amount = struct.unpack('<Q', amount_bytes)[0]  # u64 little-endian
+                        return amount
+                except Exception:
+                    continue
+        
+        return 0  # No USDC account found
+    except asyncio.TimeoutError:
+        logger.warning(f"USDC balance fetch timed out after {timeout_sec}s")
+        return None
+    except Exception as e:
+        logger.warning(f"Error fetching USDC balance: {e}")
         return None
 
 
@@ -171,6 +261,15 @@ async def main(mode: str = 'scan'):
     jupiter_backoff_base = float(os.getenv('JUPITER_BACKOFF_BASE_SECONDS', '1.0'))
     jupiter_backoff_max = float(os.getenv('JUPITER_BACKOFF_MAX_SECONDS', '30.0'))
     
+    # Non-stop mode configuration (for simulate/live)
+    balance_refresh_sol_every_sec = float(os.getenv('BALANCE_REFRESH_SOL_EVERY_SEC', '2.0'))
+    balance_refresh_usdc_every_sec = float(os.getenv('BALANCE_REFRESH_USDC_EVERY_SEC', '15.0'))
+    balance_force_refresh_usdc_if_older_sec = float(os.getenv('BALANCE_FORCE_REFRESH_USDC_IF_OLDER_SEC', '5.0'))
+    balance_refresh_rpc_timeout_sec = float(os.getenv('BALANCE_REFRESH_RPC_TIMEOUT_SEC', '2.0'))
+    loop_idle_sleep_sec = float(os.getenv('LOOP_IDLE_SLEEP_SEC', '2.0'))
+    fail_backoff_base_sec = float(os.getenv('FAIL_BACKOFF_BASE_SEC', '1.0'))
+    fail_backoff_max_sec = float(os.getenv('FAIL_BACKOFF_MAX_SEC', '30.0'))
+    
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
     # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
     if not max_slippage_bps_explicitly_set and slippage_bps_explicitly_set:
@@ -241,14 +340,18 @@ async def main(mode: str = 'scan'):
     sol_balance = 0.0
     usdc_balance = 0.0
     
-    # Update wallet balance
+    # Token mint addresses
+    sol_mint = "So11111111111111111111111111111111111111112"
+    usdc_mint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    
+    # Update wallet balances (token-aware)
     if wallet:
         balance = await solana.get_balance()
-        risk_manager.update_wallet_balance(balance)
         sol_balance = balance / 1e9  # Convert from lamports to SOL
-        logger.info(f"{colors['CYAN']}SOL balance:{colors['RESET']} {colors['GREEN']}{sol_balance:.4f}{colors['RESET']} {colors['CYAN']}SOL{colors['RESET']}")
+        logger.info(f"SOL balance: {colors['GREEN']}{sol_balance:.4f}{colors['RESET']} {colors['CYAN']}SOL{colors['RESET']}")
         
         # Get USDC balance
+        usdc_units = 0  # in smallest units (6 decimals)
         try:
             from solana.rpc.commitment import Confirmed
             from solana.rpc.types import TokenAccountOpts
@@ -330,6 +433,7 @@ async def main(mode: str = 'scan'):
                             # Use little-endian unsigned long long (Q)
                             amount_bytes = account_data_bytes[64:72]
                             amount = struct.unpack('<Q', amount_bytes)[0]  # u64 little-endian
+                            usdc_units = amount  # Store in smallest units
                             usdc_balance = amount / 1e6  # USDC has 6 decimals
                             logger.debug(f"USDC found! Raw amount: {amount}, UI amount: {usdc_balance}")
                             break  # USDC found, exit loop
@@ -339,10 +443,18 @@ async def main(mode: str = 'scan'):
             else:
                 logger.debug("No token accounts found in result.value")
             
-            logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} {colors['GREEN']}{usdc_balance:.2f}{colors['RESET']} {colors['CYAN']}USDC{colors['RESET']}")
+            logger.info(f"USDC balance: {colors['GREEN']}{usdc_balance:.2f}{colors['RESET']} {colors['CYAN']}USDC{colors['RESET']}")
         except Exception as e:
             logger.warning(f"Could not retrieve USDC balance: {e}", exc_info=True)
             logger.info(f"{colors['CYAN']}USDC balance:{colors['RESET']} {colors['GREEN']}0.00{colors['RESET']} {colors['CYAN']}USDC{colors['RESET']}")
+            usdc_units = 0
+        
+        # Update RiskManager with token-aware balances
+        balances_by_mint = {
+            sol_mint: int(balance),  # SOL in lamports
+            usdc_mint: usdc_units  # USDC in smallest units (6 decimals)
+        }
+        risk_manager.update_wallet_balances(balances_by_mint)
     
     # Get tokens from config (minimal set: SOL, USDC, JUP, BONK)
     tokens_config = config.get('tokens', {})
@@ -407,9 +519,9 @@ async def main(mode: str = 'scan'):
         
         diagnostic_amount_sol = float(os.getenv('DIAGNOSTIC_AMOUNT_SOL', '1.0'))
         
-        logger.info(f"Request: SOL → USDC")
-        logger.info(f"Amount: {diagnostic_amount_sol} SOL")
-        logger.info(f"Parameters: slippageBps={diagnostic_slippage_bps}, onlyDirectRoutes=false")
+        logger.info(f"Request: {colors['CYAN']}SOL{colors['RESET']} → {colors['CYAN']}USDC{colors['RESET']}")
+        logger.info(f"Amount: {colors['GREEN']}{diagnostic_amount_sol}{colors['RESET']} {colors['CYAN']}SOL{colors['RESET']}")
+        logger.info(f"Parameters: slippageBps={colors['GREEN']}{diagnostic_slippage_bps}{colors['RESET']}, onlyDirectRoutes=false")
         
         quote = await jupiter.get_sol_price_usdc(
             slippage_bps=diagnostic_slippage_bps,
@@ -470,7 +582,7 @@ async def main(mode: str = 'scan'):
     # This makes USDC-based cycles comparable/fair instead of reusing SOL lamports for all cycles.
     max_position_absolute_sol_calc = risk_config.max_position_size_absolute_usdc / risk_config.sol_price_usdc
 
-    available_sol_lamports = risk_manager.get_available_balance() if wallet else 1_000_000_000  # 1 SOL default
+    available_sol_lamports = risk_manager.get_available_balance(sol_mint) if wallet else 1_000_000_000  # 1 SOL default
     test_amount_sol = min(
         int(available_sol_lamports * risk_config.max_position_size_percent / 100),
         int(max_position_absolute_sol_calc * 1e9)
@@ -492,7 +604,7 @@ async def main(mode: str = 'scan'):
     
     # Log effective runtime configuration with test_amount and cycles count
     logger.info(
-        f"{colors['CYAN']}Effective config:{colors['RESET']} "
+        f"Effective config: "
         f"mode={colors['CYAN']}{mode}{colors['RESET']}, "
         f"MIN_PROFIT_USDC={colors['YELLOW']}{risk_config.min_profit_usdc:.4f}{colors['RESET']}, "
         f"MIN_PROFIT_BPS={colors['GREEN']}{risk_config.min_profit_bps}{colors['RESET']}, "
@@ -506,9 +618,167 @@ async def main(mode: str = 'scan'):
         f"CYCLES={colors['GREEN']}{len(cycles)}{colors['RESET']}"
     )
     
+    async def run_nonstop(
+        mode: str,
+        finder: ArbitrageFinder,
+        trader: Trader,
+        solana: SolanaClient,
+        jupiter: JupiterClient,
+        risk_manager: RiskManager,
+        wallet: Keypair,
+        tokens_map: Dict[str, str],
+        cycles: list,
+        amounts_by_mint: Dict[str, int],
+        sol_mint: str,
+        usdc_mint: str,
+        initial_sol_lamports: int,
+        initial_usdc_units: int,
+        start_token: str,
+        test_amount: int
+    ):
+        """Non-stop runner for simulate/live modes with smart balance refresh."""
+        user_pubkey = str(wallet.pubkey())
+        
+        # Initialize balance state
+        sol_lamports_last = initial_sol_lamports
+        usdc_units_last = initial_usdc_units
+        t_sol_last = time.monotonic()
+        t_usdc_last = time.monotonic()
+        fail_streak = 0
+        
+        # Callback for immediate processing when opportunity is found
+        async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
+            """Process opportunity immediately with retries."""
+            nonlocal usdc_units_last, t_usdc_last
+            
+            cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
+            base_mint = opp.cycle[0]
+            
+            # Force refresh USDC if this is a USDC-base opportunity and balance is stale
+            if base_mint == usdc_mint:
+                t_now = time.monotonic()
+                age = t_now - t_usdc_last
+                if age >= balance_force_refresh_usdc_if_older_sec:
+                    logger.debug(f"USDC balance is {age:.1f}s old, forcing refresh before USDC-base opportunity")
+                    new_usdc_units = await fetch_usdc_units(
+                        solana, wallet, usdc_mint, balance_refresh_rpc_timeout_sec
+                    )
+                    if new_usdc_units is not None:
+                        usdc_units_last = new_usdc_units
+                        t_usdc_last = t_now
+                        # Update risk manager immediately
+                        balances_by_mint = {
+                            sol_mint: sol_lamports_last,
+                            usdc_mint: usdc_units_last
+                        }
+                        risk_manager.update_wallet_balances(balances_by_mint)
+                        logger.debug(f"USDC balance refreshed: {usdc_units_last / 1e6:.2f} USDC")
+                    else:
+                        logger.warning("Failed to refresh USDC balance before opportunity, using stale value")
+            
+            logger.debug(f"Found opportunity: {colors['CYAN']}{cycle_display}{colors['RESET']}")
+            
+            try:
+                # Use burst mode for fast processing
+                async with jupiter.rate_limiter.burst():
+                    success_count = await trader.process_opportunity_with_retries(
+                        opp.cycle,
+                        opp.initial_amount,
+                        user_pubkey,
+                        max_retries=10,
+                        first_attempt_use_original_opportunity=True,
+                        original_opportunity=opp
+                    )
+                
+                if success_count > 0:
+                    logger.info(
+                        f"Processed {colors['GREEN']}{success_count}{colors['RESET']} "
+                        f"successful {'simulations' if mode == 'simulate' else 'executions'}"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}",
+                    exc_info=True
+                )
+            
+            # Continue searching
+            return True
+        
+        logger.info(f"Starting non-stop {colors['CYAN']}{mode.upper()}{colors['RESET']} mode")
+        logger.debug(
+            f"Balance refresh config: SOL every {balance_refresh_sol_every_sec}s "
+            f"(0=every cycle), USDC every {balance_refresh_usdc_every_sec}s, "
+            f"force refresh if >{balance_force_refresh_usdc_if_older_sec}s old"
+        )
+        
+        # Main non-stop loop
+        while True:
+            try:
+                # Update balances based on timers
+                t_now = time.monotonic()
+                
+                # Update SOL balance if needed
+                if balance_refresh_sol_every_sec == 0 or (t_now - t_sol_last) >= balance_refresh_sol_every_sec:
+                    new_sol_lamports = await fetch_sol_lamports(solana, balance_refresh_rpc_timeout_sec)
+                    if new_sol_lamports is not None:
+                        sol_lamports_last = new_sol_lamports
+                        t_sol_last = t_now
+                        logger.debug(f"SOL balance refreshed: {sol_lamports_last / 1e9:.4f} SOL")
+                
+                # Update USDC balance if needed
+                if (t_now - t_usdc_last) >= balance_refresh_usdc_every_sec:
+                    new_usdc_units = await fetch_usdc_units(
+                        solana, wallet, usdc_mint, balance_refresh_rpc_timeout_sec
+                    )
+                    if new_usdc_units is not None:
+                        usdc_units_last = new_usdc_units
+                        t_usdc_last = t_now
+                        logger.debug(f"USDC balance refreshed: {usdc_units_last / 1e6:.2f} USDC")
+                    else:
+                        logger.warning("Failed to refresh USDC balance, using stale value")
+                
+                # Update risk manager with current balances
+                balances_by_mint = {
+                    sol_mint: sol_lamports_last,
+                    usdc_mint: usdc_units_last
+                }
+                risk_manager.update_wallet_balances(balances_by_mint)
+                
+                # Reset fail streak on successful iteration
+                fail_streak = 0
+                
+                # Find and process opportunities
+                await finder.find_opportunities(
+                    start_token,
+                    test_amount,
+                    max_opportunities=100,  # High limit, callback processes immediately
+                    on_opportunity_found=on_opportunity_found,
+                    amounts_by_mint=amounts_by_mint
+                )
+                
+                # Idle sleep after scanning
+                logger.debug(f"No more opportunities in current cycle, sleeping {loop_idle_sleep_sec}s")
+                await asyncio.sleep(loop_idle_sleep_sec)
+                
+            except KeyboardInterrupt:
+                logger.info("Stopping bot...")
+                break
+            except Exception as e:
+                fail_streak += 1
+                backoff_sec = min(
+                    fail_backoff_base_sec * (2 ** (fail_streak - 1)),
+                    fail_backoff_max_sec
+                )
+                logger.error(
+                    f"{colors['RED']}Error in {mode} loop (streak: {fail_streak}):{colors['RESET']} {e}",
+                    exc_info=True
+                )
+                logger.warning(f"Backing off for {backoff_sec:.1f}s before retry...")
+                await asyncio.sleep(backoff_sec)
+    
     try:
         if mode == 'scan':
-            logger.info(f"{colors['CYAN']}Mode: {colors['CYAN']}SCAN (read-only){colors['RESET']}")
+            logger.info(f"Starting {colors['CYAN']}SCAN (read-only){colors['RESET']} mode")
             usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
             sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
             logger.info(f"Optimized scan: cycles={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
@@ -543,47 +813,34 @@ async def main(mode: str = 'scan'):
                 logger.info(f"{colors['RED']}No profitable opportunities found{colors['RESET']}")
         
         elif mode == 'simulate':
-            logger.info(f"{colors['CYAN']}Mode: {colors['CYAN']}SIMULATE{colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for simulation")
                 return
             
-            user_pubkey = str(wallet.pubkey())
+            # Get initial balances
+            initial_sol_lamports = int(sol_balance * 1e9) if sol_balance > 0 else 0
+            initial_usdc_units = int(usdc_balance * 1e6) if usdc_balance > 0 else 0
             
-            # Callback for immediate processing when opportunity is found
-            async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
-                """Process opportunity immediately with retries (burst mode for fast processing)."""
-                cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
-                logger.info(f"Found opportunity: {colors['CYAN']}{cycle_display}{colors['RESET']}")
-                
-                # Use burst mode for fast processing (recheck, swap, simulate, execute)
-                async with jupiter.rate_limiter.burst():
-                    success_count = await trader.process_opportunity_with_retries(
-                        opp.cycle,
-                        opp.initial_amount,
-                        user_pubkey,
-                        max_retries=10,
-                        first_attempt_use_original_opportunity=True,
-                        original_opportunity=opp
-                    )
-                
-                if success_count > 0:
-                    logger.info(f"Processed {colors['GREEN']}{success_count}{colors['RESET']} successful simulations")
-                
-                # Continue searching for more opportunities
-                return True
-            
-            # Use callback for immediate processing
-            await finder.find_opportunities(
-                start_token,
-                test_amount,
-                max_opportunities=100,  # High limit, callback will process immediately
-                on_opportunity_found=on_opportunity_found,
-                amounts_by_mint=amounts_by_mint
+            await run_nonstop(
+                mode='simulate',
+                finder=finder,
+                trader=trader,
+                solana=solana,
+                jupiter=jupiter,
+                risk_manager=risk_manager,
+                wallet=wallet,
+                tokens_map=tokens_map,
+                cycles=cycles,
+                amounts_by_mint=amounts_by_mint,
+                sol_mint=sol_mint,
+                usdc_mint=usdc_mint,
+                initial_sol_lamports=initial_sol_lamports,
+                initial_usdc_units=initial_usdc_units,
+                start_token=start_token,
+                test_amount=test_amount
             )
         
         elif mode == 'live':
-            logger.info(f"{colors['CYAN']}Mode: {colors['CYAN']}LIVE (real trading){colors['RESET']}")
             if not wallet:
                 logger.error("Wallet required for live trading")
                 return
@@ -594,66 +851,31 @@ async def main(mode: str = 'scan'):
             logger.warning("=" * 60)
             
             # Additional confirmation check (can be removed if automated)
-            import time
             logger.warning("Starting live mode in 3 seconds... Press Ctrl+C to cancel")
             await asyncio.sleep(3)
             
-            user_pubkey = str(wallet.pubkey())
+            # Get initial balances
+            initial_sol_lamports = int(sol_balance * 1e9) if sol_balance > 0 else 0
+            initial_usdc_units = int(usdc_balance * 1e6) if usdc_balance > 0 else 0
             
-            # Callback for immediate processing when opportunity is found
-            async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
-                """Process opportunity immediately with retries (burst mode for fast processing)."""
-                # Don't log "Found opportunity" here - it will be logged in process_opportunity_with_retries
-                # when actual processing starts, avoiding spam for opportunities that drop on recheck
-                
-                try:
-                    # Use burst mode for fast processing (recheck, swap, simulate, execute)
-                    async with jupiter.rate_limiter.burst():
-                        success_count = await trader.process_opportunity_with_retries(
-                            opp.cycle,
-                            opp.initial_amount,
-                            user_pubkey,
-                            max_retries=10,
-                            first_attempt_use_original_opportunity=True,
-                            original_opportunity=opp
-                        )
-                    
-                    if success_count > 0:
-                        logger.info(f"Processed {colors['GREEN']}{success_count}{colors['RESET']} successful executions")
-                    # If success_count == 0, it was already logged in process_opportunity_with_retries
-                except Exception as e:
-                    logger.error(f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}", exc_info=True)
-                
-                # Continue searching for more opportunities
-                return True
-            
-            # Continuous loop
-            while True:
-                try:
-                    # Update balance
-                    balance = await solana.get_balance()
-                    risk_manager.update_wallet_balance(balance)
-                    sol_balance = balance / 1e9
-                    
-                    # Find opportunities with callback for immediate processing
-                    await finder.find_opportunities(
-                        start_token,
-                        test_amount,
-                        max_opportunities=100,  # High limit, callback will process immediately
-                        on_opportunity_found=on_opportunity_found,
-                        amounts_by_mint=amounts_by_mint
-                    )
-                    
-                    # Wait before next search iteration
-                    logger.info("No more opportunities in current cycle, waiting...")
-                    await asyncio.sleep(5)
-                    
-                except KeyboardInterrupt:
-                    logger.info("Stopping bot...")
-                    break
-                except Exception as e:
-                    logger.error(f"Error in live loop: {e}")
-                    await asyncio.sleep(5)
+            await run_nonstop(
+                mode='live',
+                finder=finder,
+                trader=trader,
+                solana=solana,
+                jupiter=jupiter,
+                risk_manager=risk_manager,
+                wallet=wallet,
+                tokens_map=tokens_map,
+                cycles=cycles,
+                amounts_by_mint=amounts_by_mint,
+                sol_mint=sol_mint,
+                usdc_mint=usdc_mint,
+                initial_sol_lamports=initial_sol_lamports,
+                initial_usdc_units=initial_usdc_units,
+                start_token=start_token,
+                test_amount=test_amount
+            )
         
         else:
             logger.error(f"Unknown mode: {mode}. Use: scan, simulate, or live")
