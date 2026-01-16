@@ -161,10 +161,10 @@ class ArbitrageFinder:
 
                     # If callback provided, call it immediately (processing will pause the search loop)
                     if on_opportunity_found:
-                        logger.info(f"{colors['DIM']}Calling on_opportunity_found callback...{colors['RESET']}")
+                        logger.debug(f"{colors['DIM']}Calling on_opportunity_found callback...{colors['RESET']}")
                         try:
                             should_continue = await on_opportunity_found(result)
-                            logger.info(f"{colors['DIM']}Callback finished, should_continue={should_continue}{colors['RESET']}")
+                            logger.debug(f"{colors['DIM']}Callback finished, should_continue={should_continue}{colors['RESET']}")
                         except Exception as e:
                             logger.error(f"Error in on_opportunity_found callback: {e}", exc_info=True)
                             should_continue = True  # Continue on error to avoid blocking
