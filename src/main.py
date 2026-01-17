@@ -270,6 +270,11 @@ async def main(mode: str = 'scan'):
     fail_backoff_base_sec = float(os.getenv('FAIL_BACKOFF_BASE_SEC', '1.0'))
     fail_backoff_max_sec = float(os.getenv('FAIL_BACKOFF_MAX_SEC', '30.0'))
     
+    # SOL price refresh configuration
+    sol_price_refresh_every_sec = float(os.getenv('SOL_PRICE_REFRESH_EVERY_SEC', '300.0'))  # 5 minutes default
+    sol_price_refresh_timeout_sec = float(os.getenv('SOL_PRICE_REFRESH_TIMEOUT_SEC', '2.0'))
+    sol_price_refresh_log_every_n = int(os.getenv('SOL_PRICE_REFRESH_LOG_EVERY_N', '12'))  # Log every ~1 hour if 5min interval
+    
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
     # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
     if not max_slippage_bps_explicitly_set and slippage_bps_explicitly_set:
@@ -615,7 +620,7 @@ async def main(mode: str = 'scan'):
         f"TEST_AMOUNT_SOL={colors['GREEN']}{test_amount_sol/1e9:.6f}{colors['RESET']} ({colors['DIM']}{test_amount_sol} lamports{colors['RESET']}), "
         f"TEST_AMOUNT_USDC={colors['GREEN']}{test_amount_usdc/1e6:.2f}{colors['RESET']} ({colors['DIM']}{test_amount_usdc} units{colors['RESET']}), "
         f"QUOTE_DELAY_SECONDS={colors['GREEN']}{quote_delay_seconds}{colors['RESET']}, "
-        f"CYCLES={colors['GREEN']}{len(cycles)}{colors['RESET']}"
+        f"PATHS_CONFIGURED={colors['GREEN']}{len(cycles)}{colors['RESET']}"
     )
     
     async def run_nonstop(
@@ -645,6 +650,11 @@ async def main(mode: str = 'scan'):
         t_sol_last = time.monotonic()
         t_usdc_last = time.monotonic()
         fail_streak = 0
+        
+        # Initialize SOL price refresh state
+        sol_price_usdc_last = risk_manager.config.sol_price_usdc
+        t_sol_price_last = time.monotonic()
+        price_update_count = 0
         
         # Callback for immediate processing when opportunity is found
         async def on_opportunity_found(opp: ArbitrageOpportunity) -> bool:
@@ -696,10 +706,26 @@ async def main(mode: str = 'scan'):
                         f"successful {'simulations' if mode == 'simulate' else 'executions'}"
                     )
             except Exception as e:
-                logger.error(
-                    f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}",
-                    exc_info=True
+                error_msg = str(e)
+                # Check if this is an expected "infra" error (swap-instructions unavailable)
+                is_infra_error = (
+                    "Failed to build atomic VersionedTransaction" in error_msg or
+                    "Failed to get swap instructions" in error_msg or
+                    "swap-instructions" in error_msg.lower() or
+                    "cannot unpack" in error_msg.lower()
                 )
+                
+                if is_infra_error:
+                    # Log as WARNING without traceback (expected infra issue)
+                    logger.warning(
+                        f"{colors['YELLOW']}Skipping opportunity (infra issue):{colors['RESET']} {error_msg}"
+                    )
+                else:
+                    # Unexpected error - log with traceback
+                    logger.error(
+                        f"{colors['RED']}Error in process_opportunity_with_retries:{colors['RESET']} {e}",
+                        exc_info=True
+                    )
             
             # Continue searching
             return True
@@ -709,6 +735,11 @@ async def main(mode: str = 'scan'):
             f"Balance refresh config: SOL every {balance_refresh_sol_every_sec}s "
             f"(0=every cycle), USDC every {balance_refresh_usdc_every_sec}s, "
             f"force refresh if >{balance_force_refresh_usdc_if_older_sec}s old"
+        )
+        logger.debug(
+            f"SOL price refresh: every {sol_price_refresh_every_sec}s, "
+            f"timeout: {sol_price_refresh_timeout_sec}s, "
+            f"log every {sol_price_refresh_log_every_n} updates"
         )
         
         # Main non-stop loop
@@ -736,6 +767,47 @@ async def main(mode: str = 'scan'):
                         logger.debug(f"USDC balance refreshed: {usdc_units_last / 1e6:.2f} USDC")
                     else:
                         logger.warning("Failed to refresh USDC balance, using stale value")
+                
+                # Update SOL→USDC price if needed
+                if (t_now - t_sol_price_last) >= sol_price_refresh_every_sec:
+                    try:
+                        new_price = await asyncio.wait_for(
+                            jupiter.get_sol_price_usdc(slippage_bps=10),
+                            timeout=sol_price_refresh_timeout_sec
+                        )
+                        if new_price and new_price > 0:
+                            # Save old price for logging
+                            old_price = sol_price_usdc_last
+                            
+                            # Calculate price change percentage
+                            price_change_pct = abs((new_price - old_price) / old_price * 100) if old_price > 0 else 0
+                            price_update_count += 1
+                            
+                            # Update price in risk_manager and finder
+                            risk_manager.config.sol_price_usdc = new_price
+                            finder.sol_price_usdc = new_price
+                            sol_price_usdc_last = new_price
+                            t_sol_price_last = t_now
+                            
+                            # Log conditionally: if significant change (>0.5%) or every N updates
+                            should_log = (price_change_pct >= 0.5) or (price_update_count % sol_price_refresh_log_every_n == 0)
+                            if should_log:
+                                if price_change_pct >= 0.5:
+                                    logger.info(
+                                        f"SOL price updated: {colors['YELLOW']}${new_price:.2f}{colors['RESET']} USDC "
+                                        f"({colors['YELLOW']}{price_change_pct:+.2f}%{colors['RESET']} from ${old_price:.2f})"
+                                    )
+                                else:
+                                    logger.debug(
+                                        f"SOL price refreshed: {colors['YELLOW']}${new_price:.2f}{colors['RESET']} USDC "
+                                        f"(update #{price_update_count})"
+                                    )
+                        else:
+                            logger.debug("Failed to fetch SOL price (invalid response), keeping previous value")
+                    except asyncio.TimeoutError:
+                        logger.debug(f"SOL price fetch timed out after {sol_price_refresh_timeout_sec}s, keeping previous value")
+                    except Exception as e:
+                        logger.debug(f"Error fetching SOL price: {e}, keeping previous value")
                 
                 # Update risk manager with current balances
                 balances_by_mint = {
@@ -781,7 +853,7 @@ async def main(mode: str = 'scan'):
             logger.info(f"Starting {colors['CYAN']}SCAN (read-only){colors['RESET']} mode")
             usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
             sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
-            logger.info(f"Optimized scan: cycles={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
+            logger.info(f"Optimized scan: paths={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
@@ -817,6 +889,87 @@ async def main(mode: str = 'scan'):
                 logger.error("Wallet required for simulation")
                 return
             
+            # Preflight check: verify swap-instructions availability
+            logger.info(f"{colors['CYAN']}Preflight check: verifying swap-instructions availability...{colors['RESET']}")
+            try:
+                # Test with SOL -> USDC swap (small amount: 0.1 SOL)
+                test_input_mint = sol_mint
+                test_output_mint = usdc_mint
+                test_amount = int(0.1 * 1e9)  # 0.1 SOL in lamports
+                
+                test_quote = await jupiter.get_quote(
+                    input_mint=test_input_mint,
+                    output_mint=test_output_mint,
+                    amount=test_amount,
+                    slippage_bps=50
+                )
+                
+                if test_quote is None:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: Cannot get quote for {test_input_mint[:8]}... -> {test_output_mint[:8]}...{colors['RESET']}"
+                    )
+                    return
+                
+                # Try to get swap instructions
+                user_pubkey = str(wallet.pubkey())
+                instructions_resp = await jupiter.get_swap_instructions(
+                    quote=test_quote,
+                    user_public_key=user_pubkey,
+                    priority_fee_lamports=0,
+                    wrap_unwrap_sol=True,
+                    dynamic_compute_unit_limit=True,
+                    slippage_bps=50
+                )
+                
+                if instructions_resp is None:
+                    # Log detailed error information
+                    jupiter_url = os.getenv('JUPITER_API_URL', 'not set (using fallback)')
+                    jupiter_key = os.getenv('JUPITER_API_KEY', 'not set')
+                    key_status = "set" if jupiter_key != "not set" else "not set"
+                    
+                    logger.error("=" * 60)
+                    logger.error(f"{colors['RED']}PREFLIGHT FAILED: Swap-instructions unavailable{colors['RESET']}")
+                    logger.error("=" * 60)
+                    logger.error(f"Jupiter API URL: {colors['CYAN']}{jupiter_url}{colors['RESET']}")
+                    logger.error(f"Jupiter API Key: {colors['CYAN']}{key_status}{colors['RESET']}")
+                    logger.error("")
+                    logger.error(f"{colors['YELLOW']}Solution:{colors['RESET']}")
+                    logger.error("  1. Set JUPITER_API_URL=https://api.jup.ag (or use default)")
+                    logger.error("  2. Set JUPITER_API_KEY=<your-api-key> (if required)")
+                    logger.error("  3. Ensure Jupiter API supports instructions-only mode")
+                    logger.error("")
+                    logger.error(f"{colors['RED']}Cannot proceed with simulate mode without swap-instructions.{colors['RESET']}")
+                    logger.error("=" * 60)
+                    return
+                
+                # Validate response structure
+                if not instructions_resp.swap_instruction:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: swap_instruction is missing in response{colors['RESET']}"
+                    )
+                    return
+                
+                if not instructions_resp.swap_instruction.program_id:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: swap_instruction.program_id is empty{colors['RESET']}"
+                    )
+                    return
+                
+                if instructions_resp.last_valid_block_height < 0:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: invalid last_valid_block_height: {instructions_resp.last_valid_block_height}{colors['RESET']}"
+                    )
+                    return
+                
+                logger.info(f"{colors['GREEN']}Preflight check passed: swap-instructions available{colors['RESET']}")
+                
+            except Exception as e:
+                logger.error(
+                    f"{colors['RED']}Preflight check failed with exception: {e}{colors['RESET']}",
+                    exc_info=True
+                )
+                return
+            
             # Get initial balances
             initial_sol_lamports = int(sol_balance * 1e9) if sol_balance > 0 else 0
             initial_usdc_units = int(usdc_balance * 1e6) if usdc_balance > 0 else 0
@@ -843,6 +996,87 @@ async def main(mode: str = 'scan'):
         elif mode == 'live':
             if not wallet:
                 logger.error("Wallet required for live trading")
+                return
+            
+            # Preflight check: verify swap-instructions availability
+            logger.info(f"{colors['CYAN']}Preflight check: verifying swap-instructions availability...{colors['RESET']}")
+            try:
+                # Test with SOL -> USDC swap (small amount: 0.1 SOL)
+                test_input_mint = sol_mint
+                test_output_mint = usdc_mint
+                test_amount = int(0.1 * 1e9)  # 0.1 SOL in lamports
+                
+                test_quote = await jupiter.get_quote(
+                    input_mint=test_input_mint,
+                    output_mint=test_output_mint,
+                    amount=test_amount,
+                    slippage_bps=50
+                )
+                
+                if test_quote is None:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: Cannot get quote for {test_input_mint[:8]}... -> {test_output_mint[:8]}...{colors['RESET']}"
+                    )
+                    return
+                
+                # Try to get swap instructions
+                user_pubkey = str(wallet.pubkey())
+                instructions_resp = await jupiter.get_swap_instructions(
+                    quote=test_quote,
+                    user_public_key=user_pubkey,
+                    priority_fee_lamports=0,
+                    wrap_unwrap_sol=True,
+                    dynamic_compute_unit_limit=True,
+                    slippage_bps=50
+                )
+                
+                if instructions_resp is None:
+                    # Log detailed error information
+                    jupiter_url = os.getenv('JUPITER_API_URL', 'not set (using fallback)')
+                    jupiter_key = os.getenv('JUPITER_API_KEY', 'not set')
+                    key_status = "set" if jupiter_key != "not set" else "not set"
+                    
+                    logger.error("=" * 60)
+                    logger.error(f"{colors['RED']}PREFLIGHT FAILED: Swap-instructions unavailable{colors['RESET']}")
+                    logger.error("=" * 60)
+                    logger.error(f"Jupiter API URL: {colors['CYAN']}{jupiter_url}{colors['RESET']}")
+                    logger.error(f"Jupiter API Key: {colors['CYAN']}{key_status}{colors['RESET']}")
+                    logger.error("")
+                    logger.error(f"{colors['YELLOW']}Solution:{colors['RESET']}")
+                    logger.error("  1. Set JUPITER_API_URL=https://api.jup.ag (or use default)")
+                    logger.error("  2. Set JUPITER_API_KEY=<your-api-key> (if required)")
+                    logger.error("  3. Ensure Jupiter API supports instructions-only mode")
+                    logger.error("")
+                    logger.error(f"{colors['RED']}Cannot proceed with live mode without swap-instructions.{colors['RESET']}")
+                    logger.error("=" * 60)
+                    return
+                
+                # Validate response structure
+                if not instructions_resp.swap_instruction:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: swap_instruction is missing in response{colors['RESET']}"
+                    )
+                    return
+                
+                if not instructions_resp.swap_instruction.program_id:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: swap_instruction.program_id is empty{colors['RESET']}"
+                    )
+                    return
+                
+                if instructions_resp.last_valid_block_height < 0:
+                    logger.error(
+                        f"{colors['RED']}Preflight failed: invalid last_valid_block_height: {instructions_resp.last_valid_block_height}{colors['RESET']}"
+                    )
+                    return
+                
+                logger.info(f"{colors['GREEN']}Preflight check passed: swap-instructions available{colors['RESET']}")
+                
+            except Exception as e:
+                logger.error(
+                    f"{colors['RED']}Preflight check failed with exception: {e}{colors['RESET']}",
+                    exc_info=True
+                )
                 return
             
             # STRICT WARNING: Live mode sends real transactions

@@ -99,10 +99,10 @@ class ArbitrageFinder:
         cycles = self.cycles
         
         if not cycles:
-            logger.warning("No cycles configured. Please add cycles to config.json")
+            logger.warning("No paths configured. Please add paths to config.json")
             return []
         
-        logger.info(f"{colors['DIM']}Searching {len(cycles)} cycles for arbitrage opportunities...{colors['RESET']}")
+        logger.info(f"{colors['DIM']}Searching {len(cycles)} paths for arbitrage opportunities...{colors['RESET']}")
         if on_opportunity_found:
             logger.debug("Callback on_opportunity_found is provided, will call it for each profitable opportunity")
         else:
@@ -210,7 +210,7 @@ class ArbitrageFinder:
         # Use cycles from config.json (already in mint-address form)
         cycles = self.cycles
         
-        logger.info(f"{colors['DIM']}Searching {len(cycles)} cycles for arbitrage opportunities (stream mode)...{colors['RESET']}")
+        logger.info(f"{colors['DIM']}Searching {len(cycles)} paths for arbitrage opportunities (stream mode)...{colors['RESET']}")
         
         for cycle in cycles:
             result = await self._check_cycle(cycle, amount)

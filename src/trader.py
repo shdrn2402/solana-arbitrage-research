@@ -642,14 +642,14 @@ class Trader:
                 f"Invalid cycle length for atomic transaction: {len(opportunity.cycle)} "
                 f"(expected 4 for 3-leg cycle)"
             )
-            return None
+            return None, None
         
         if len(opportunity.quotes) != 3:
             logger.error(
                 f"Invalid quotes count for atomic transaction: {len(opportunity.quotes)} "
                 f"(expected 3 for 3-leg cycle)"
             )
-            return None
+            return None, None
         
         cycle_display = ' -> '.join(self.tokens_map.get(addr, addr[:8]) for addr in opportunity.cycle)
         logger.debug(
@@ -674,7 +674,7 @@ class Trader:
                 
                 if instructions_resp is None:
                     logger.error(f"Failed to get swap instructions for leg {i+1}")
-                    return None
+                    return None, None
                 
                 leg_instructions.append(instructions_resp)
                 all_alt_addresses.update(instructions_resp.address_lookup_tables)
@@ -687,10 +687,10 @@ class Trader:
                 )
             except NotImplementedError as e:
                 logger.error(f"Leg {i+1} failed: {e}")
-                return None
+                return None, None
             except Exception as e:
                 logger.error(f"Error getting instructions for leg {i+1}: {e}", exc_info=True)
-                return None
+                return None, None
         
         # Calculate minimum last_valid_block_height (most restrictive)
         min_last_valid_block_height = min(last_valid_block_heights) if last_valid_block_heights else 0
@@ -706,7 +706,7 @@ class Trader:
                 logger.debug(f"Loaded {colors['GREEN']}{len(alt_accounts)}{colors['RESET']} ALT accounts")
             except Exception as e:
                 logger.error(f"Failed to load ALT accounts: {e}")
-                return None
+                return None, None
         
         # Build instruction list in order:
         # A) ComputeBudget (if needed - skip for now, Jupiter handles it)
@@ -751,18 +751,18 @@ class Trader:
         
         if not all_instructions:
             logger.error("No instructions to build transaction")
-            return None
+            return None, None
         
         # Get recent blockhash
         recent_blockhash = await self.solana.get_recent_blockhash()
         if not recent_blockhash:
             logger.error("Failed to get recent blockhash")
-            return None
+            return None, None
         
         # Get wallet pubkey
         if self.solana.wallet is None:
             logger.error("No wallet available for transaction signing")
-            return None
+            return None, None
         
         payer = self.solana.wallet.pubkey()
         
@@ -783,22 +783,32 @@ class Trader:
             # Validate that we got MessageV0 (not legacy)
             if not isinstance(message_v0, MessageV0):
                 logger.error(f"Expected MessageV0, got {type(message_v0)}")
-                return None
+                return None, None
             
-            # Create VersionedTransaction from MessageV0
-            # VersionedTransaction(message, signatures)
-            # Signatures will be empty initially, we'll sign after creation
-            versioned_tx = VersionedTransaction(message_v0, [])
+            # Create VersionedTransaction from MessageV0 with signer
+            # VersionedTransaction automatically signs when signers are passed
+            versioned_tx = VersionedTransaction(message_v0, [self.solana.wallet])
             
-            # Sign transaction with wallet
-            # VersionedTransaction.sign() expects a list of signers
-            versioned_tx.sign([self.solana.wallet])
+            # Early size check: Solana transaction size limit is 1232 bytes (raw)
+            tx_bytes = bytes(versioned_tx)
+            raw_len = len(tx_bytes)
+            b64_len = len(base64.b64encode(tx_bytes))
+            
+            if raw_len > 1232:
+                logger.warning(
+                    f"Atomic VT too large: raw={colors['YELLOW']}{raw_len}{colors['RESET']} bytes "
+                    f"(max 1232), b64={colors['YELLOW']}{b64_len}{colors['RESET']} bytes, "
+                    f"instr={colors['GREEN']}{len(all_instructions)}{colors['RESET']}, "
+                    f"ALTs={colors['GREEN']}{len(alt_accounts)}{colors['RESET']}: skipping opportunity"
+                )
+                return None, None
             
             # Log transaction details
             logger.info(
                 f"{colors['GREEN']}Atomic VersionedTransaction built (v0):{colors['RESET']} "
                 f"{colors['GREEN']}{len(all_instructions)}{colors['RESET']} instructions, "
                 f"{colors['GREEN']}{len(alt_accounts)}{colors['RESET']} ALTs, "
+                f"size={colors['GREEN']}{raw_len}{colors['RESET']}/{colors['YELLOW']}1232{colors['RESET']} bytes, "
                 f"message_type: {colors['CYAN']}v0{colors['RESET']}, "
                 f"last_valid_block_height: {colors['YELLOW']}{min_last_valid_block_height}{colors['RESET']}"
             )

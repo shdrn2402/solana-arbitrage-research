@@ -579,11 +579,13 @@ class JupiterClient:
             endpoints_to_try.append(self.api_url)
         
         # 4) Try fallback endpoints (swap-capable)
-        # api.jup.ag often works for swap even without key
+        # Always try both AUTH and PUBLIC endpoints for swap-instructions
+        # Different endpoints may support different paths (e.g., /swap-instructions vs /swap/v1/swap)
         swap_capable_endpoints = []
         if self.api_key:
-            # If we have API key, prefer authenticated endpoints
+            # If we have API key, prefer AUTH first, then PUBLIC
             swap_capable_endpoints.extend(self.AUTH_ENDPOINTS)
+            swap_capable_endpoints.extend(self.PUBLIC_ENDPOINTS)
         else:
             # Try public endpoints first, then authenticated (some work without key)
             swap_capable_endpoints.extend(self.PUBLIC_ENDPOINTS)
@@ -643,7 +645,9 @@ class JupiterClient:
             "wrapUnwrapSOL": wrap_unwrap_sol,
             "dynamicComputeUnitLimit": dynamic_compute_unit_limit,
             # Request instructions instead of full transaction
-            "onlyLegs": True  # This parameter requests instructions only
+            "onlyLegs": True,  # This parameter requests instructions only
+            # Enable shared accounts to increase ALT usage
+            "useSharedAccounts": True
         }
         
         # Add priority fee if specified
@@ -656,168 +660,256 @@ class JupiterClient:
         if dynamic_slippage:
             payload["dynamicSlippage"] = dynamic_slippage
         
-        # Get list of endpoints to try
+        # Get list of endpoints to try (always include both AUTH and PUBLIC)
         endpoints_to_try = self._get_swap_endpoints_to_try()
         if not endpoints_to_try:
             logger.error("No Jupiter API endpoint available for swap instructions")
             return None
         
+        # Candidate paths to try (in order of preference)
+        candidate_paths = [
+            "/swap/v1/swap-instructions",
+            "/swap-instructions",
+            "/swap/v1/swap"  # Fallback, but don't treat swapTransaction-only as failure
+        ]
+        
+        # Track errors for summary
+        error_summary = {
+            'endpoints_tried': 0,
+            'paths_tried': 0,
+            'http_codes': {},
+            'swap_transaction_only': 0,
+            'network_errors': 0,
+            'other_errors': 0
+        }
+        
         # Try each endpoint in order
         for endpoint in endpoints_to_try:
-            # Retry on 429 with exponential backoff
-            for attempt in range(self.max_retries_on_429 + 1):
-                try:
-                    # Apply rate limiting before each HTTP POST (including retries and endpoint switches)
-                    await self.rate_limiter.acquire()
+            error_summary['endpoints_tried'] += 1
+            base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
+            
+            # Try each path for this endpoint
+            for path in candidate_paths:
+                error_summary['paths_tried'] += 1
+                swap_url = f"{base_url}{path}"
+                
+                # Retry on 429 with exponential backoff
+                # Also handle useSharedAccounts fallback (if 400, retry without it)
+                use_shared_accounts = True
+                
+                for attempt in range(self.max_retries_on_429 + 1):
+                    try:
+                        # Apply rate limiting before each HTTP POST
+                        await self.rate_limiter.acquire()
+                        
+                        # Try with useSharedAccounts first, fallback without it if 400
+                        current_payload = payload.copy()
+                        if not use_shared_accounts:
+                            # Remove useSharedAccounts if we already tried and it failed
+                            current_payload.pop("useSharedAccounts", None)
+                        
+                        response = await self.client.post(swap_url, json=current_payload)
+                        response.raise_for_status()
+                        data = response.json()
+                        
+                        # Check if response contains swapInstruction (success case)
+                        if "swapInstruction" in data:
+                            # Success! Parse and return instructions
                     
-                    # Try /swap/v1/swap endpoint with onlyLegs parameter
-                    base_url = endpoint.rstrip('/v6').rstrip('/v1').rstrip('/')
-                    swap_url = f"{base_url}/swap/v1/swap"
-                    response = await self.client.post(swap_url, json=payload)
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    # Check if response contains instructions (not just swapTransaction)
-                    if "swapTransaction" in data and "swapInstruction" not in data:
-                        # Endpoint doesn't support instructions-only mode - try next endpoint
-                        logger.debug(
-                            f"Endpoint {endpoint} does not support instructions-only mode "
-                            "(response contains swapTransaction but not instructions). Trying next endpoint."
-                        )
-                        raise NotImplementedError(
-                            "Jupiter API endpoint does not support instructions-only mode. "
-                            "Cannot build atomic multi-leg transactions."
-                        )
-                    
-                    # Parse instructions from response
-                    # Expected format (if supported):
-                    # {
-                    #   "setupInstructions": [...],
-                    #   "swapInstruction": {...},
-                    #   "cleanupInstruction": {...},
-                    #   "addressLookupTables": [...],
-                    #   "lastValidBlockHeight": ...
-                    # }
-                    
-                    last_valid_block_height = data.get("lastValidBlockHeight", 0)
-                    if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
-                        logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
-                    
-                    # Parse setup instructions
-                    setup_instructions = []
-                    if "setupInstructions" in data:
-                        for instr_data in data["setupInstructions"]:
-                            accounts = self._parse_accounts(instr_data.get("accounts", []))
-                            setup_instructions.append(SwapInstruction(
-                                program_id=instr_data.get("programId", ""),
-                                accounts=accounts,
-                                data=instr_data.get("data", "")
-                            ))
-                    
-                    # Parse swap instruction
-                    if "swapInstruction" not in data:
-                        logger.error("swapInstruction not found in Jupiter API response")
-                        raise NotImplementedError("Jupiter API response missing swapInstruction field")
-                    
-                    swap_instr_data = data["swapInstruction"]
-                    swap_accounts = self._parse_accounts(swap_instr_data.get("accounts", []))
-                    swap_instruction = SwapInstruction(
-                        program_id=swap_instr_data.get("programId", ""),
-                        accounts=swap_accounts,
-                        data=swap_instr_data.get("data", "")
-                    )
-                    
-                    # Parse cleanup instruction (optional)
-                    cleanup_instruction = None
-                    if "cleanupInstruction" in data and data["cleanupInstruction"]:
-                        cleanup_instr_data = data["cleanupInstruction"]
-                        cleanup_accounts = self._parse_accounts(cleanup_instr_data.get("accounts", []))
-                        cleanup_instruction = SwapInstruction(
-                            program_id=cleanup_instr_data.get("programId", ""),
-                            accounts=cleanup_accounts,
-                            data=cleanup_instr_data.get("data", "")
-                        )
-                    
-                    # Parse address lookup tables
-                    address_lookup_tables = data.get("addressLookupTables", [])
-                    
-                    instructions_response = JupiterSwapInstructionsResponse(
-                        setup_instructions=setup_instructions,
-                        swap_instruction=swap_instruction,
-                        cleanup_instruction=cleanup_instruction,
-                        address_lookup_tables=address_lookup_tables,
-                        last_valid_block_height=last_valid_block_height,
-                        priority_fee_lamports=priority_fee_lamports
-                    )
-                    
-                    # Cache successful endpoint
-                    self._working_swap_endpoint = endpoint
-                    
-                    logger.debug(
-                        f"Swap instructions received from {endpoint}: {len(setup_instructions)} setup, "
-                        f"1 swap, {1 if cleanup_instruction else 0} cleanup, "
-                        f"{len(address_lookup_tables)} ALTs, "
-                        f"last_valid_block_height: {last_valid_block_height}"
-                    )
-                    return instructions_response
-                    
-                except NotImplementedError:
-                    # Endpoint doesn't support instructions - try next endpoint (don't mark as tried)
-                    logger.debug(f"Endpoint {endpoint} doesn't support instructions-only mode, trying next endpoint")
-                    break  # Break out of retry loop, continue to next endpoint
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code == 401:
-                        # Unauthorized - mark endpoint as tried and continue to next
-                        logger.debug(f"Endpoint {endpoint} returned 401 (unauthorized), trying next endpoint")
-                        self._tried_endpoints.add(endpoint)
-                        break  # Break out of retry loop, continue to next endpoint
-                    elif e.response.status_code == 429:
-                        # Rate limit exceeded - retry with backoff
-                        if attempt < self.max_retries_on_429:
-                            # Check for Retry-After header
-                            retry_after = e.response.headers.get("Retry-After")
-                            if retry_after:
-                                try:
-                                    wait_time = float(retry_after)
-                                except ValueError:
-                                    wait_time = self.backoff_base_seconds * (2 ** attempt)
-                            else:
-                                # Exponential backoff
-                                wait_time = min(
-                                    self.backoff_base_seconds * (2 ** attempt),
-                                    self.backoff_max_seconds
+                            # Parse instructions from response
+                            # Expected format:
+                            # {
+                            #   "setupInstructions": [...],
+                            #   "swapInstruction": {...},
+                            #   "cleanupInstruction": {...},
+                            #   "addressLookupTables": [...],
+                            #   "lastValidBlockHeight": ...
+                            # }
+                            
+                            last_valid_block_height = data.get("lastValidBlockHeight", 0)
+                            if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
+                                logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
+                            
+                            # Parse setup instructions
+                            setup_instructions = []
+                            if "setupInstructions" in data:
+                                for instr_data in data["setupInstructions"]:
+                                    accounts = self._parse_accounts(instr_data.get("accounts", []))
+                                    setup_instructions.append(SwapInstruction(
+                                        program_id=instr_data.get("programId", ""),
+                                        accounts=accounts,
+                                        data=instr_data.get("data", "")
+                                    ))
+                            
+                            # Parse swap instruction
+                            swap_instr_data = data["swapInstruction"]
+                            swap_accounts = self._parse_accounts(swap_instr_data.get("accounts", []))
+                            swap_instruction = SwapInstruction(
+                                program_id=swap_instr_data.get("programId", ""),
+                                accounts=swap_accounts,
+                                data=swap_instr_data.get("data", "")
+                            )
+                            
+                            # Parse cleanup instruction (optional)
+                            cleanup_instruction = None
+                            if "cleanupInstruction" in data and data["cleanupInstruction"]:
+                                cleanup_instr_data = data["cleanupInstruction"]
+                                cleanup_accounts = self._parse_accounts(cleanup_instr_data.get("accounts", []))
+                                cleanup_instruction = SwapInstruction(
+                                    program_id=cleanup_instr_data.get("programId", ""),
+                                    accounts=cleanup_accounts,
+                                    data=cleanup_instr_data.get("data", "")
                                 )
                             
-                            logger.warning(
-                                f"Rate limit exceeded (429) for swap instructions from {endpoint}, "
-                                f"retrying in {wait_time:.1f}s (attempt {attempt + 1}/{self.max_retries_on_429})"
+                            # Parse address lookup tables (robust extraction from multiple possible keys)
+                            raw_alts = (
+                                data.get("addressLookupTables")
+                                or data.get("addressLookupTableAddresses")
+                                or []
                             )
-                            await asyncio.sleep(wait_time)
-                            continue
-                        else:
-                            # Max retries reached - try next endpoint
-                            logger.error(f"Rate limit exceeded (429) for swap instructions from {endpoint} after {self.max_retries_on_429} retries, trying next endpoint")
-                            break  # Break out of retry loop, continue to next endpoint
-                    
-                    # Check if endpoint doesn't support instructions-only mode (400 with specific error)
-                    if e.response.status_code == 400:
-                        error_text = e.response.text.lower()
-                        if "onlylegs" in error_text or "instructions" in error_text:
+                            address_lookup_tables: List[str] = []
+                            if isinstance(raw_alts, list):
+                                for x in raw_alts:
+                                    if isinstance(x, str):
+                                        address_lookup_tables.append(x)
+                                    elif isinstance(x, dict):
+                                        # Support various dict formats: {"accountKey": "..."}, {"address": "..."}, {"key": "..."}
+                                        for key in ("accountKey", "address", "key"):
+                                            if isinstance(x.get(key), str):
+                                                address_lookup_tables.append(x[key])
+                                                break
+                            
+                            # Deduplicate while preserving order
+                            seen = set()
+                            address_lookup_tables = [
+                                a for a in address_lookup_tables
+                                if not (a in seen or seen.add(a))
+                            ]
+                            
+                            instructions_response = JupiterSwapInstructionsResponse(
+                                setup_instructions=setup_instructions,
+                                swap_instruction=swap_instruction,
+                                cleanup_instruction=cleanup_instruction,
+                                address_lookup_tables=address_lookup_tables,
+                                last_valid_block_height=last_valid_block_height,
+                                priority_fee_lamports=priority_fee_lamports
+                            )
+                            
+                            # Cache successful endpoint + path
+                            self._working_swap_endpoint = endpoint
+                            
+                            logger.info(
+                                f"Swap instructions OK via {swap_url}: "
+                                f"{len(setup_instructions)} setup, 1 swap, "
+                                f"{1 if cleanup_instruction else 0} cleanup, "
+                                f"{len(address_lookup_tables)} ALTs"
+                            )
+                            return instructions_response
+                        
+                        # Check if response contains only swapTransaction (no swapInstruction)
+                        elif "swapTransaction" in data and "swapInstruction" not in data:
+                            # This path doesn't support instructions-only mode - try next path
+                            error_summary['swap_transaction_only'] += 1
                             logger.debug(
-                                f"Endpoint {endpoint} does not support instructions-only mode: {e.response.status_code} - {e.response.text}. Trying next endpoint."
+                                f"Path {path} on {endpoint} returned swapTransaction-only, trying next path"
                             )
-                            break  # Break out of retry loop, continue to next endpoint
-                    
-                    # Other HTTP errors - try next endpoint
-                    logger.debug(f"Endpoint {endpoint} returned {e.response.status_code}, trying next endpoint")
-                    break  # Break out of retry loop, continue to next endpoint
-                except Exception as e:
-                    # Network/parse errors - try next endpoint
-                    logger.debug(f"Error with endpoint {endpoint}: {e}, trying next endpoint")
-                    break  # Break out of retry loop, continue to next endpoint
+                            break  # Break out of retry loop, try next path
+                        
+                        else:
+                            # Response doesn't contain swapInstruction or swapTransaction
+                            error_summary['other_errors'] += 1
+                            logger.debug(
+                                f"Unexpected response from {swap_url}: missing both swapInstruction and swapTransaction"
+                            )
+                            break  # Break out of retry loop, try next path
+                            
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 401:
+                            # Unauthorized - mark endpoint as tried and continue to next
+                            error_summary['http_codes'][401] = error_summary['http_codes'].get(401, 0) + 1
+                            logger.debug(f"Path {path} on {endpoint} returned 401 (unauthorized), trying next path")
+                            self._tried_endpoints.add(endpoint)
+                            break  # Break out of retry loop, try next path
+                        elif e.response.status_code == 429:
+                            # Rate limit exceeded - retry with backoff
+                            if attempt < self.max_retries_on_429:
+                                # Check for Retry-After header
+                                retry_after = e.response.headers.get("Retry-After")
+                                if retry_after:
+                                    try:
+                                        wait_time = float(retry_after)
+                                    except ValueError:
+                                        wait_time = self.backoff_base_seconds * (2 ** attempt)
+                                else:
+                                    # Exponential backoff
+                                    wait_time = min(
+                                        self.backoff_base_seconds * (2 ** attempt),
+                                        self.backoff_max_seconds
+                                    )
+                                
+                                logger.warning(
+                                    f"Rate limit exceeded (429) for swap instructions from {swap_url}, "
+                                    f"retrying in {wait_time:.1f}s (attempt {attempt + 1}/{self.max_retries_on_429})"
+                                )
+                                await asyncio.sleep(wait_time)
+                                continue
+                            else:
+                                # Max retries reached - try next path
+                                logger.error(f"Rate limit exceeded (429) for swap instructions from {swap_url} after {self.max_retries_on_429} retries, trying next path")
+                                break  # Break out of retry loop, try next path
+                        
+                        # Check if endpoint doesn't support instructions-only mode (400 with specific error)
+                        elif e.response.status_code == 400:
+                            error_text = e.response.text.lower()
+                            # Check if it's useSharedAccounts that's not supported
+                            if use_shared_accounts and ("sharedaccounts" in error_text or "useSharedAccounts" in error_text):
+                                # Retry without useSharedAccounts
+                                use_shared_accounts = False
+                                logger.debug(f"Path {path} on {endpoint} doesn't support useSharedAccounts, retrying without it")
+                                continue  # Retry with same path but without useSharedAccounts
+                            elif "onlylegs" in error_text or "instructions" in error_text:
+                                error_summary['swap_transaction_only'] += 1
+                                logger.debug(
+                                    f"Path {path} on {endpoint} does not support instructions-only: {e.response.status_code} - {e.response.text}. Trying next path."
+                                )
+                                break  # Break out of retry loop, try next path
+                        
+                        # Track HTTP status codes and try next path
+                        status_code = e.response.status_code
+                        error_summary['http_codes'][status_code] = error_summary['http_codes'].get(status_code, 0) + 1
+                        logger.debug(f"Path {path} on {endpoint} returned {e.response.status_code}, trying next path")
+                        break  # Break out of retry loop, try next path
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
+                        # Network/parse errors - try next path
+                        error_summary['network_errors'] += 1
+                        logger.debug(f"Network error with {swap_url}: {e}, trying next path")
+                        break  # Break out of retry loop, try next path
+                    except Exception as e:
+                        # Other errors - try next path
+                        error_summary['other_errors'] += 1
+                        logger.debug(f"Error with {swap_url}: {e}, trying next path")
+                        break  # Break out of retry loop, try next path
+            
+            # If we've tried all paths for this endpoint without success, continue to next endpoint
         
-        # All endpoints failed
-        logger.error("All Jupiter API endpoints failed for swap instructions")
+        # All endpoints/paths failed - log summary
+        error_parts = []
+        if error_summary['endpoints_tried'] > 0:
+            error_parts.append(f"tried {error_summary['endpoints_tried']} endpoint(s)")
+        if error_summary['paths_tried'] > 0:
+            error_parts.append(f"tried {error_summary['paths_tried']} path(s)")
+        if error_summary['http_codes']:
+            codes_str = ', '.join(f"{code}({count})" for code, count in error_summary['http_codes'].items())
+            error_parts.append(f"HTTP codes: {codes_str}")
+        if error_summary['swap_transaction_only'] > 0:
+            error_parts.append(f"{error_summary['swap_transaction_only']} swapTransaction-only response(s)")
+        if error_summary['network_errors'] > 0:
+            error_parts.append(f"{error_summary['network_errors']} network error(s)")
+        if error_summary['other_errors'] > 0:
+            error_parts.append(f"{error_summary['other_errors']} other error(s)")
+        
+        summary_msg = " | ".join(error_parts) if error_parts else "unknown reasons"
+        logger.error(f"All Jupiter API endpoints/paths failed for swap instructions: {summary_msg}")
         return None
     
     async def get_sol_price_usdc(

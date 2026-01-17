@@ -426,6 +426,189 @@ class TestJupiterClient:
             assert len(instructions_response.setup_instructions) == 0
             assert instructions_response.cleanup_instruction is None
             assert instructions_response.swap_instruction is not None
+            assert instructions_response.address_lookup_tables == []
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_alt_addresses_new_key(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions parses ALTs from addressLookupTableAddresses key."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTableAddresses": [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222"
+            ],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(
+                quote,
+                "user_pubkey"
+            )
+            
+            assert instructions_response is not None
+            assert instructions_response.address_lookup_tables == [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222"
+            ]
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_alt_addresses_old_key(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions parses ALTs from addressLookupTables key (backward compatibility)."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTables": [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222"
+            ],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(
+                quote,
+                "user_pubkey"
+            )
+            
+            assert instructions_response is not None
+            assert instructions_response.address_lookup_tables == [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222"
+            ]
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_alt_addresses_dict_format(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions parses ALTs from dict format with various keys."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTables": [
+                {"accountKey": "ALT1Address1111111111111111111111111111111"},
+                {"address": "ALT2Address2222222222222222222222222222222"},
+                {"key": "ALT3Address3333333333333333333333333333333"}
+            ],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(
+                quote,
+                "user_pubkey"
+            )
+            
+            assert instructions_response is not None
+            assert len(instructions_response.address_lookup_tables) == 3
+            assert "ALT1Address1111111111111111111111111111111" in instructions_response.address_lookup_tables
+            assert "ALT2Address2222222222222222222222222222222" in instructions_response.address_lookup_tables
+            assert "ALT3Address3333333333333333333333333333333" in instructions_response.address_lookup_tables
+    
+    @pytest.mark.asyncio
+    async def test_get_swap_instructions_alt_addresses_deduplication(self, client, sol_mint, usdc_mint):
+        """Test get_swap_instructions deduplicates ALT addresses while preserving order."""
+        quote = JupiterQuote(
+            input_mint=sol_mint,
+            output_mint=usdc_mint,
+            in_amount=1_000_000_000,
+            out_amount=100_000_000,
+            price_impact_pct=0.5,
+            route_plan=[]
+        )
+        
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "setupInstructions": [],
+            "swapInstruction": {
+                "programId": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+                "accounts": [
+                    {"pubkey": "swap_account1", "isSigner": True, "isWritable": True}
+                ],
+                "data": "swap_data"
+            },
+            "addressLookupTables": [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222",
+                "ALT1Address1111111111111111111111111111111",  # Duplicate
+                "ALT3Address3333333333333333333333333333333"
+            ],
+            "lastValidBlockHeight": 12345
+        }
+        mock_response.raise_for_status = MagicMock()
+        
+        with patch.object(client.client, 'post', return_value=mock_response):
+            client._working_endpoint = "https://api.jup.ag"
+            
+            instructions_response = await client.get_swap_instructions(
+                quote,
+                "user_pubkey"
+            )
+            
+            assert instructions_response is not None
+            # Should have 3 unique ALTs, preserving order
+            assert len(instructions_response.address_lookup_tables) == 3
+            assert instructions_response.address_lookup_tables == [
+                "ALT1Address1111111111111111111111111111111",
+                "ALT2Address2222222222222222222222222222222",
+                "ALT3Address3333333333333333333333333333333"
+            ]
     
     @pytest.mark.asyncio
     async def test_get_swap_instructions_not_implemented(self, client, sol_mint, usdc_mint):

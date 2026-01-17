@@ -8,7 +8,7 @@
     "RAY": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R"
   },
   "arbitrage": {
-    "min_profit_usdc": 0.1,
+    "min_profit_usdc": 0.05,
     "max_cycle_length": 4,
     "max_cycles": 100,
     "quote_timeout": 5.0
