@@ -304,6 +304,9 @@ async def main(mode: str = 'scan'):
     sol_price_refresh_timeout_sec = float(os.getenv('SOL_PRICE_REFRESH_TIMEOUT_SEC', '2.0'))
     sol_price_refresh_log_every_n = int(os.getenv('SOL_PRICE_REFRESH_LOG_EVERY_N', '12'))  # Log every ~1 hour if 5min interval
     
+    # Route negative cache configuration
+    negative_cache_ttl_sec = int(os.getenv('NEGATIVE_CACHE_TTL_SEC', '600'))  # 10 minutes default
+    
     # Warn if MAX_SLIPPAGE_BPS not explicitly set (only if SLIPPAGE_BPS is explicitly set)
     # This preserves backward compatibility: if both are unset (defaults 50/50), no warning
     if not max_slippage_bps_explicitly_set and slippage_bps_explicitly_set:
@@ -544,7 +547,8 @@ async def main(mode: str = 'scan'):
         use_jito=use_jito,
         mode=mode,  # Pass mode for strict checking
         slippage_bps=slippage_bps,
-        tokens_map=tokens_map
+        tokens_map=tokens_map,
+        negative_cache_ttl_sec=negative_cache_ttl_sec
     )
     
     # DIAGNOSTIC MODE: Test if Jupiter can return routes at all

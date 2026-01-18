@@ -3,6 +3,7 @@ Main trading module that orchestrates arbitrage execution.
 """
 import asyncio
 import logging
+import os
 import time
 import uuid
 import base64
@@ -34,6 +35,122 @@ colors = get_terminal_colors()
 
 logger = logging.getLogger(__name__)
 
+
+class RouteNegativeCache:
+    """
+    TTL-based negative cache for unstable Jupiter routes.
+    
+    Caches routes that fail with:
+    - 6024 + SharedAccountsRoute error
+    - Atomic VT size overflow (> 1232 bytes)
+    
+    to avoid repeated simulate/RPC calls for the same failing route.
+    """
+    
+    def __init__(self, ttl_seconds: int = 600, ttl_size_overflow_seconds: int = 600):
+        """
+        Initialize negative cache.
+        
+        Args:
+            ttl_seconds: Time-to-live for 6024 error cache entries (default: 600 = 10 minutes)
+            ttl_size_overflow_seconds: Time-to-live for size overflow cache entries (default: 600 = 10 minutes)
+        """
+        self.ttl_seconds = ttl_seconds
+        self.ttl_size_overflow_seconds = ttl_size_overflow_seconds
+        # route_signature -> (failure_type: str, timestamp: float)
+        self._cache: Dict[str, Tuple[str, float]] = {}
+    
+    def _get_route_signature(
+        self,
+        cycle_mints: str,
+        legs_count: int,
+        use_shared_accounts: bool,
+        program_ids_fingerprint: str
+    ) -> str:
+        """
+        Generate route signature from route characteristics.
+        
+        Args:
+            cycle_mints: Cycle mints string (e.g., "USDC->RAY->SOL->USDC")
+            legs_count: Number of legs (quotes count)
+            use_shared_accounts: Whether useSharedAccounts was used
+            program_ids_fingerprint: Comma-separated program IDs
+        
+        Returns:
+            Route signature string
+        """
+        return f"{cycle_mints}|{legs_count}|{use_shared_accounts}|{program_ids_fingerprint}"
+    
+    def is_cached(self, route_signature: str, failure_type: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[float]]:
+        """
+        Check if route is cached (still within TTL).
+        
+        Args:
+            route_signature: Route signature
+            failure_type: Optional failure type filter ("atomic_size_overflow" or "6024_shared_accounts")
+                          If None, checks for any cached failure type
+        
+        Returns:
+            Tuple of (is_cached: bool, cached_failure_type: Optional[str], ttl_remaining: Optional[float])
+            ttl_remaining is None if not cached, otherwise seconds remaining
+        """
+        if route_signature not in self._cache:
+            return False, None, None
+        
+        cached_failure_type, timestamp = self._cache[route_signature]
+        
+        # If failure_type filter specified, check it matches
+        if failure_type is not None and cached_failure_type != failure_type:
+            return False, None, None
+        
+        current_time = time.monotonic()
+        age = current_time - timestamp
+        
+        # Select TTL based on failure type
+        ttl = self.ttl_size_overflow_seconds if cached_failure_type == "atomic_size_overflow" else self.ttl_seconds
+        
+        if age >= ttl:
+            # TTL expired, remove entry
+            del self._cache[route_signature]
+            return False, None, None
+        
+        ttl_remaining = ttl - age
+        return True, cached_failure_type, ttl_remaining
+    
+    def cache_route(self, route_signature: str, failure_type: str = "6024_shared_accounts") -> None:
+        """
+        Cache a route with current timestamp and failure type.
+        
+        Args:
+            route_signature: Route signature
+            failure_type: Failure type ("atomic_size_overflow" or "6024_shared_accounts")
+        """
+        # Don't overwrite existing entry - TTL is counted from first detection
+        if route_signature in self._cache:
+            return
+        
+        self._cache[route_signature] = (failure_type, time.monotonic())
+        ttl = self.ttl_size_overflow_seconds if failure_type == "atomic_size_overflow" else self.ttl_seconds
+        logger.info(f"Negative-cache route for TTL={ttl}s (type={failure_type}): {route_signature}")
+    
+    def cleanup_expired(self) -> int:
+        """
+        Remove expired entries from cache.
+        
+        Returns:
+            Number of entries removed
+        """
+        current_time = time.monotonic()
+        expired = []
+        for sig, (failure_type, timestamp) in self._cache.items():
+            ttl = self.ttl_size_overflow_seconds if failure_type == "atomic_size_overflow" else self.ttl_seconds
+            if (current_time - timestamp) >= ttl:
+                expired.append(sig)
+        for sig in expired:
+            del self._cache[sig]
+        return len(expired)
+
+
 class Trader:
     """Main trading orchestrator."""
     
@@ -47,7 +164,8 @@ class Trader:
         use_jito: bool = False,
         mode: str = 'scan',  # 'scan', 'simulate', or 'live'
         slippage_bps: int = 50,
-        tokens_map: Optional[Dict[str, str]] = None
+        tokens_map: Optional[Dict[str, str]] = None,
+        negative_cache_ttl_sec: int = 600
     ):
         self.jupiter = jupiter_client
         self.solana = solana_client
@@ -59,6 +177,11 @@ class Trader:
         self.trade_in_progress = False  # Protection against parallel trades
         self.slippage_bps = slippage_bps
         self.tokens_map = tokens_map or {}
+        negative_cache_ttl_size_overflow_sec = int(os.getenv('NEGATIVE_CACHE_TTL_SIZE_OVERFLOW_SEC', '600'))
+        self.negative_cache = RouteNegativeCache(
+            ttl_seconds=negative_cache_ttl_sec,
+            ttl_size_overflow_seconds=negative_cache_ttl_size_overflow_sec
+        )
     
     async def scan_opportunities(
         self,
@@ -295,10 +418,72 @@ class Trader:
         
         # Use atomic VT for multi-leg cycles (len(quotes) > 1)
         if len(opportunity.quotes) > 1:
-            # Build atomic VersionedTransaction
-            vt, min_last_valid_block_height = await self._build_atomic_cycle_vt(opportunity, user_pubkey)
+            # Get swap instructions for all legs first (needed for route signature and cache check)
+            leg_instructions: List[JupiterSwapInstructionsResponse] = []
+            for i, quote in enumerate(opportunity.quotes):
+                try:
+                    instructions_resp = await self.jupiter.get_swap_instructions(
+                        quote=quote,
+                        user_public_key=user_pubkey,
+                        priority_fee_lamports=self.priority_fee,
+                        wrap_unwrap_sol=True,
+                        dynamic_compute_unit_limit=True,
+                        slippage_bps=self.slippage_bps
+                    )
+                    
+                    if instructions_resp is None:
+                        return False, f"Failed to get swap instructions for leg {i+1}", None, None
+                    
+                    leg_instructions.append(instructions_resp)
+                except Exception as e:
+                    return False, f"Error getting instructions for leg {i+1}: {e}", None, None
+            
+            # Form full route signature for negative cache check
+            # useSharedAccounts is True by default in get_swap_instructions (see jupiter_client.py line 650)
+            use_shared_accounts = True
+            route_signature = self._get_route_signature(
+                opportunity=opportunity,
+                leg_instructions=leg_instructions,
+                use_shared_accounts=use_shared_accounts
+            )
+            
+            # Check negative cache for size overflow BEFORE building VT
+            is_cached, cached_failure_type, ttl_remaining = self.negative_cache.is_cached(
+                route_signature, failure_type="atomic_size_overflow"
+            )
+            if is_cached and cached_failure_type == "atomic_size_overflow":
+                logger.info(
+                    f"Skipping route by size-cache (ttl_remaining={ttl_remaining:.1f}s): "
+                    f"{cycle_display}"
+                )
+                return False, "skipped_by_size_cache", None, None
+            
+            # Build atomic VersionedTransaction (with pre-fetched instructions to avoid duplicate API calls)
+            vt, min_last_valid_block_height, fail_reason, fail_meta = await self._build_atomic_cycle_vt(
+                opportunity, user_pubkey, leg_instructions=leg_instructions
+            )
+            
+            # Handle size overflow: cache and return
+            if vt is None and fail_reason == "atomic_size_overflow":
+                # Cache the route for TTL
+                self.negative_cache.cache_route(route_signature, failure_type="atomic_size_overflow")
+                
+                # Log caching with details from fail_meta
+                raw_size = fail_meta.get("raw_size_bytes", 0) if fail_meta else 0
+                max_size = fail_meta.get("max_size_bytes", 1232) if fail_meta else 1232
+                instr_count = fail_meta.get("instr_count", 0) if fail_meta else 0
+                alts_count = fail_meta.get("alts_count", 0) if fail_meta else 0
+                ttl = self.negative_cache.ttl_size_overflow_seconds
+                
+                logger.info(
+                    f"Atomic VT too large -> caching route "
+                    f"(raw={raw_size}, max={max_size}, instr={instr_count}, alts={alts_count}, ttl={ttl}s): "
+                    f"{cycle_display}"
+                )
+                return False, "atomic_size_overflow", None, None
             
             if vt is None:
+                # Other build failures - don't cache
                 return False, "Failed to build atomic VersionedTransaction", None, None
             
             # Log VT details
@@ -433,9 +618,12 @@ class Trader:
             )
             
             # B) Build atomic VersionedTransaction
-            vt, min_last_valid_block_height = await self._build_atomic_cycle_vt(opportunity, user_pubkey)
+            vt, min_last_valid_block_height, fail_reason, fail_meta = await self._build_atomic_cycle_vt(opportunity, user_pubkey)
             
             if vt is None:
+                # Handle size overflow separately (don't cache in execute mode, just return error)
+                if fail_reason == "atomic_size_overflow":
+                    return False, "atomic_size_overflow", None
                 return False, "Failed to build atomic VersionedTransaction", None
             
             # Log VT details
@@ -621,20 +809,95 @@ class Trader:
         
         return deduplicated
     
+    def _extract_program_ids_fingerprint(
+        self,
+        leg_instructions: List[JupiterSwapInstructionsResponse]
+    ) -> str:
+        """
+        Extract unique program IDs from swap instructions in order of first appearance.
+        
+        Args:
+            leg_instructions: List of JupiterSwapInstructionsResponse for each leg
+        
+        Returns:
+            Comma-separated program IDs string
+        """
+        program_ids = []
+        seen = set()
+        
+        for leg_resp in leg_instructions:
+            # Setup instructions
+            for setup_instr in leg_resp.setup_instructions:
+                if setup_instr.program_id not in seen:
+                    program_ids.append(setup_instr.program_id)
+                    seen.add(setup_instr.program_id)
+            
+            # Swap instruction
+            if leg_resp.swap_instruction.program_id not in seen:
+                program_ids.append(leg_resp.swap_instruction.program_id)
+                seen.add(leg_resp.swap_instruction.program_id)
+            
+            # Cleanup instruction
+            if leg_resp.cleanup_instruction and leg_resp.cleanup_instruction.program_id not in seen:
+                program_ids.append(leg_resp.cleanup_instruction.program_id)
+                seen.add(leg_resp.cleanup_instruction.program_id)
+        
+        return ",".join(program_ids)
+    
+    def _get_route_signature(
+        self,
+        opportunity: ArbitrageOpportunity,
+        leg_instructions: Optional[List[JupiterSwapInstructionsResponse]] = None,
+        use_shared_accounts: bool = True
+    ) -> str:
+        """
+        Generate route signature for negative cache.
+        
+        Args:
+            opportunity: ArbitrageOpportunity
+            leg_instructions: Optional list of JupiterSwapInstructionsResponse (for multi-leg)
+            use_shared_accounts: Whether useSharedAccounts was used (default: True)
+        
+        Returns:
+            Route signature string
+        """
+        # Cycle mints string
+        cycle_mints = "->".join(opportunity.cycle)
+        
+        # Legs count
+        legs_count = len(opportunity.quotes)
+        
+        # Program IDs fingerprint (if available)
+        if leg_instructions:
+            program_ids_fingerprint = self._extract_program_ids_fingerprint(leg_instructions)
+        else:
+            program_ids_fingerprint = ""  # Not available yet
+        
+        return self.negative_cache._get_route_signature(
+            cycle_mints=cycle_mints,
+            legs_count=legs_count,
+            use_shared_accounts=use_shared_accounts,
+            program_ids_fingerprint=program_ids_fingerprint
+        )
+    
     async def _build_atomic_cycle_vt(
         self,
         opportunity: ArbitrageOpportunity,
-        user_pubkey: str
-    ) -> Tuple[Optional[VersionedTransaction], Optional[int]]:
+        user_pubkey: str,
+        leg_instructions: Optional[List[JupiterSwapInstructionsResponse]] = None
+    ) -> Tuple[Optional[VersionedTransaction], Optional[int], Optional[str], Optional[Dict[str, Any]]]:
         """
         Build atomic VersionedTransaction for 3-leg cycle (all-or-nothing execution).
         
         Args:
             opportunity: ArbitrageOpportunity with 3-leg cycle
             user_pubkey: User's public key (base58)
+            leg_instructions: Optional pre-fetched swap instructions (to avoid duplicate API calls)
         
         Returns:
-            Tuple of (VersionedTransaction ready to sign and send, min_last_valid_block_height) or (None, None) if build failed
+            Tuple of (VersionedTransaction, min_last_valid_block_height, fail_reason, fail_meta) or (None, None, reason, meta) if build failed
+            fail_reason: "atomic_size_overflow" for size > 1232 bytes, "build_failed" for other errors, None for success
+            fail_meta: Dict with failure details (raw_size_bytes, max_size_bytes, instr_count, alts_count for overflow)
         """
         # Validate cycle length (must be 3-leg: 4 tokens, 3 quotes)
         if len(opportunity.cycle) != 4:
@@ -642,55 +905,63 @@ class Trader:
                 f"Invalid cycle length for atomic transaction: {len(opportunity.cycle)} "
                 f"(expected 4 for 3-leg cycle)"
             )
-            return None, None
+            return None, None, "build_failed", {"error": "Invalid cycle length"}
         
         if len(opportunity.quotes) != 3:
             logger.error(
                 f"Invalid quotes count for atomic transaction: {len(opportunity.quotes)} "
                 f"(expected 3 for 3-leg cycle)"
             )
-            return None, None
+            return None, None, "build_failed", {"error": "Invalid quotes count"}
         
         cycle_display = ' -> '.join(self.tokens_map.get(addr, addr[:8]) for addr in opportunity.cycle)
         logger.debug(
             f"Building atomic VersionedTransaction for cycle: {colors['CYAN']}{cycle_display}{colors['RESET']}"
         )
         
-        # Get instructions for each leg
-        leg_instructions: List[JupiterSwapInstructionsResponse] = []
-        all_alt_addresses: Set[str] = set()
-        last_valid_block_heights: List[int] = []
-        
-        for i, quote in enumerate(opportunity.quotes):
-            try:
-                instructions_resp = await self.jupiter.get_swap_instructions(
-                    quote=quote,
-                    user_public_key=user_pubkey,
-                    priority_fee_lamports=self.priority_fee,
-                    wrap_unwrap_sol=True,
-                    dynamic_compute_unit_limit=True,
-                    slippage_bps=self.slippage_bps
-                )
-                
-                if instructions_resp is None:
-                    logger.error(f"Failed to get swap instructions for leg {i+1}")
-                    return None, None
-                
-                leg_instructions.append(instructions_resp)
+        # Get instructions for each leg (if not provided)
+        if leg_instructions is None:
+            leg_instructions = []
+            all_alt_addresses: Set[str] = set()
+            last_valid_block_heights: List[int] = []
+            
+            for i, quote in enumerate(opportunity.quotes):
+                try:
+                    instructions_resp = await self.jupiter.get_swap_instructions(
+                        quote=quote,
+                        user_public_key=user_pubkey,
+                        priority_fee_lamports=self.priority_fee,
+                        wrap_unwrap_sol=True,
+                        dynamic_compute_unit_limit=True,
+                        slippage_bps=self.slippage_bps
+                    )
+                    
+                    if instructions_resp is None:
+                        logger.error(f"Failed to get swap instructions for leg {i+1}")
+                        return None, None, "build_failed", {"error": f"Failed to get swap instructions for leg {i+1}"}
+                    
+                    leg_instructions.append(instructions_resp)
+                    all_alt_addresses.update(instructions_resp.address_lookup_tables)
+                    last_valid_block_heights.append(instructions_resp.last_valid_block_height)
+                    
+                    logger.debug(
+                        f"Leg {i+1}: {len(instructions_resp.setup_instructions)} setup, "
+                        f"1 swap, {1 if instructions_resp.cleanup_instruction else 0} cleanup, "
+                        f"{len(instructions_resp.address_lookup_tables)} ALTs"
+                    )
+                except NotImplementedError as e:
+                    logger.error(f"Leg {i+1} failed: {e}")
+                    return None, None, "build_failed", {"error": str(e)}
+                except Exception as e:
+                    logger.error(f"Error getting instructions for leg {i+1}: {e}", exc_info=True)
+                    return None, None, "build_failed", {"error": str(e)}
+        else:
+            # Extract ALT addresses and block heights from provided instructions
+            all_alt_addresses: Set[str] = set()
+            last_valid_block_heights: List[int] = []
+            for instructions_resp in leg_instructions:
                 all_alt_addresses.update(instructions_resp.address_lookup_tables)
                 last_valid_block_heights.append(instructions_resp.last_valid_block_height)
-                
-                logger.debug(
-                    f"Leg {i+1}: {len(instructions_resp.setup_instructions)} setup, "
-                    f"1 swap, {1 if instructions_resp.cleanup_instruction else 0} cleanup, "
-                    f"{len(instructions_resp.address_lookup_tables)} ALTs"
-                )
-            except NotImplementedError as e:
-                logger.error(f"Leg {i+1} failed: {e}")
-                return None, None
-            except Exception as e:
-                logger.error(f"Error getting instructions for leg {i+1}: {e}", exc_info=True)
-                return None, None
         
         # Calculate minimum last_valid_block_height (most restrictive)
         min_last_valid_block_height = min(last_valid_block_heights) if last_valid_block_heights else 0
@@ -706,7 +977,7 @@ class Trader:
                 logger.debug(f"Loaded {colors['GREEN']}{len(alt_accounts)}{colors['RESET']} ALT accounts")
             except Exception as e:
                 logger.error(f"Failed to load ALT accounts: {e}")
-                return None, None
+                return None, None, "build_failed", {"error": f"Failed to load ALT accounts: {e}"}
         
         # Build instruction list in order:
         # A) ComputeBudget (if needed - skip for now, Jupiter handles it)
@@ -751,18 +1022,18 @@ class Trader:
         
         if not all_instructions:
             logger.error("No instructions to build transaction")
-            return None, None
+            return None, None, "build_failed", {"error": "No instructions to build transaction"}
         
         # Get recent blockhash
         recent_blockhash = await self.solana.get_recent_blockhash()
         if not recent_blockhash:
             logger.error("Failed to get recent blockhash")
-            return None, None
+            return None, None, "build_failed", {"error": "Failed to get recent blockhash"}
         
         # Get wallet pubkey
         if self.solana.wallet is None:
             logger.error("No wallet available for transaction signing")
-            return None, None
+            return None, None, "build_failed", {"error": "No wallet available for transaction signing"}
         
         payer = self.solana.wallet.pubkey()
         
@@ -783,7 +1054,7 @@ class Trader:
             # Validate that we got MessageV0 (not legacy)
             if not isinstance(message_v0, MessageV0):
                 logger.error(f"Expected MessageV0, got {type(message_v0)}")
-                return None, None
+                return None, None, "build_failed", {"error": f"Expected MessageV0, got {type(message_v0)}"}
             
             # Create VersionedTransaction from MessageV0 with signer
             # VersionedTransaction automatically signs when signers are passed
@@ -801,7 +1072,12 @@ class Trader:
                     f"instr={colors['GREEN']}{len(all_instructions)}{colors['RESET']}, "
                     f"ALTs={colors['GREEN']}{len(alt_accounts)}{colors['RESET']}: skipping opportunity"
                 )
-                return None, None
+                return None, None, "atomic_size_overflow", {
+                    "raw_size_bytes": raw_len,
+                    "max_size_bytes": 1232,
+                    "instr_count": len(all_instructions),
+                    "alts_count": len(alt_accounts)
+                }
             
             # Log transaction details
             logger.info(
@@ -821,7 +1097,7 @@ class Trader:
                     f"(address_table_lookups: {len(message_v0.address_table_lookups)})"
                 )
             
-            return versioned_tx, min_last_valid_block_height
+            return versioned_tx, min_last_valid_block_height, None, None
             
         except Exception as e:
             logger.error(
@@ -839,4 +1115,4 @@ class Trader:
                     f"ALT loading/compilation failed. "
                     f"ALT accounts: {len(alt_accounts)}, addresses: {list(all_alt_addresses)}"
                 )
-            return None, None
+            return None, None, "build_failed", {"error": str(e)}
