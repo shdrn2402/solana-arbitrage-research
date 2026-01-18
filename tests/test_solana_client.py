@@ -30,7 +30,7 @@ class TestSolanaClient:
     
     def test_solana_client_initialization(self, client, keypair):
         """Test SolanaClient can be initialized."""
-        assert client.rpc_url == "https://api.mainnet-beta.solana.com"
+        assert client.rpc_url_primary == "https://api.mainnet-beta.solana.com"
         assert client.wallet == keypair
     
     def test_solana_client_no_wallet(self, client_no_wallet):
@@ -279,3 +279,157 @@ class TestSolanaClient:
         await client.close()
         # Should not raise exception
         assert True
+    
+    @pytest.mark.asyncio
+    async def test_get_address_lookup_table_accounts_list_format(self, client):
+        """Test get_address_lookup_table_accounts parses ALT data from list format."""
+        from solders.address_lookup_table_account import AddressLookupTableAccount, AddressLookupTable
+        
+        # Create mock ALT data (minimal valid ALT structure)
+        alt_data_bytes = b'\x01' + b'\x00' * 100  # Minimal structure
+        alt_data_base64 = base64.b64encode(alt_data_bytes).decode()
+        
+        # Use valid pubkey instead of invalid base58 string
+        pubkey = Pubkey.default()
+        alt_address = str(pubkey)
+        
+        # Mock account info with list format: ["<base64>", "base64"]
+        mock_account_value = MagicMock()
+        mock_account_value.data = [alt_data_base64, "base64"]
+        
+        mock_account_info = MagicMock()
+        mock_account_info.value = mock_account_value
+        
+        with patch.object(client.client, 'get_account_info', return_value=mock_account_info):
+                # Mock AddressLookupTable.deserialize to return a table with addresses
+                mock_table = MagicMock(spec=AddressLookupTable)
+                mock_table.addresses = []
+                
+                with patch('src.solana_client.AddressLookupTable.deserialize', return_value=mock_table):
+                    # Mock AddressLookupTableAccount constructor
+                    mock_alt_account = MagicMock(spec=AddressLookupTableAccount)
+                    mock_alt_account.addresses = []
+                    
+                    with patch('src.solana_client.AddressLookupTableAccount', return_value=mock_alt_account) as mock_alt_ctor:
+                        result = await client.get_address_lookup_table_accounts([alt_address])
+                        
+                        assert len(result) == 1
+                        assert result[0] == mock_alt_account
+                        # Verify constructor was called with pubkey and table.addresses
+                        mock_alt_ctor.assert_called_once_with(pubkey, mock_table.addresses)
+    
+    @pytest.mark.asyncio
+    async def test_get_address_lookup_table_accounts_string_format(self, client):
+        """Test get_address_lookup_table_accounts parses ALT data from base64 string format."""
+        from solders.address_lookup_table_account import AddressLookupTableAccount, AddressLookupTable
+        
+        alt_data_bytes = b'\x01' + b'\x00' * 100
+        alt_data_base64 = base64.b64encode(alt_data_bytes).decode()
+        
+        # Use valid pubkey instead of invalid base58 string
+        pubkey = Pubkey.default()
+        alt_address = str(pubkey)
+        
+        # Mock account info with string format (base64)
+        mock_account_value = MagicMock()
+        mock_account_value.data = alt_data_base64
+        
+        mock_account_info = MagicMock()
+        mock_account_info.value = mock_account_value
+        
+        with patch.object(client.client, 'get_account_info', return_value=mock_account_info):
+                mock_table = MagicMock(spec=AddressLookupTable)
+                mock_table.addresses = []
+                
+                with patch('src.solana_client.AddressLookupTable.deserialize', return_value=mock_table):
+                    mock_alt_account = MagicMock(spec=AddressLookupTableAccount)
+                    mock_alt_account.addresses = []
+                    
+                    with patch('src.solana_client.AddressLookupTableAccount', return_value=mock_alt_account) as mock_alt_ctor:
+                        result = await client.get_address_lookup_table_accounts([alt_address])
+                        
+                        assert len(result) == 1
+                        assert result[0] == mock_alt_account
+                        mock_alt_ctor.assert_called_once_with(pubkey, mock_table.addresses)
+    
+    @pytest.mark.asyncio
+    async def test_get_address_lookup_table_accounts_bytes_with_base64_fallback(self, client):
+        """Test get_address_lookup_table_accounts handles bytes containing ASCII-base64 with fallback."""
+        from solders.address_lookup_table_account import AddressLookupTableAccount, AddressLookupTable
+        
+        alt_data_bytes = b'\x01' + b'\x00' * 100
+        alt_data_base64_str = base64.b64encode(alt_data_bytes).decode()
+        alt_data_base64_bytes = alt_data_base64_str.encode('ascii')
+        
+        # Use valid pubkey instead of invalid base58 string
+        pubkey = Pubkey.default()
+        alt_address = str(pubkey)
+        
+        # Mock account info with bytes format (containing ASCII-base64)
+        mock_account_value = MagicMock()
+        mock_account_value.data = alt_data_base64_bytes
+        
+        mock_account_info = MagicMock()
+        mock_account_info.value = mock_account_value
+        
+        with patch.object(client.client, 'get_account_info', return_value=mock_account_info):
+                mock_alt_account = MagicMock(spec=AddressLookupTableAccount)
+                mock_alt_account.addresses = []
+                
+                # First call fails (trying raw bytes), second succeeds (after base64 decode)
+                with patch('src.solana_client.AddressLookupTable.deserialize') as mock_deserialize:
+                    mock_table = MagicMock(spec=AddressLookupTable)
+                    mock_table.addresses = []
+                    
+                    # First call fails with exception, second succeeds with decoded bytes
+                    mock_deserialize.side_effect = [
+                        Exception("unexpected end of file"),  # First attempt (raw bytes)
+                        mock_table  # Second attempt (after base64 decode)
+                    ]
+                    
+                    with patch('src.solana_client.AddressLookupTableAccount', return_value=mock_alt_account) as mock_alt_ctor:
+                        result = await client.get_address_lookup_table_accounts([alt_address])
+                        
+                        # Should have tried twice: once with raw bytes, once with decoded
+                        assert mock_deserialize.call_count == 2
+                        assert len(result) == 1
+                        assert result[0] == mock_alt_account
+                        
+                        # Verify second call was with decoded bytes
+                        second_call_args = mock_deserialize.call_args_list[1]
+                        assert second_call_args[0][0] == alt_data_bytes
+                        # Verify constructor was called with pubkey and table.addresses
+                        mock_alt_ctor.assert_called_once_with(pubkey, mock_table.addresses)
+    
+    @pytest.mark.asyncio
+    async def test_get_address_lookup_table_accounts_bytes_raw_success(self, client):
+        """Test get_address_lookup_table_accounts handles raw bytes successfully."""
+        from solders.address_lookup_table_account import AddressLookupTableAccount, AddressLookupTable
+        
+        alt_data_bytes = b'\x01' + b'\x00' * 100
+        
+        # Use valid pubkey instead of invalid base58 string
+        pubkey = Pubkey.default()
+        alt_address = str(pubkey)
+        
+        # Mock account info with raw bytes format
+        mock_account_value = MagicMock()
+        mock_account_value.data = alt_data_bytes
+        
+        mock_account_info = MagicMock()
+        mock_account_info.value = mock_account_value
+        
+        with patch.object(client.client, 'get_account_info', return_value=mock_account_info):
+                mock_table = MagicMock(spec=AddressLookupTable)
+                mock_table.addresses = []
+                
+                with patch('src.solana_client.AddressLookupTable.deserialize', return_value=mock_table):
+                    mock_alt_account = MagicMock(spec=AddressLookupTableAccount)
+                    mock_alt_account.addresses = []
+                    
+                    with patch('src.solana_client.AddressLookupTableAccount', return_value=mock_alt_account) as mock_alt_ctor:
+                        result = await client.get_address_lookup_table_accounts([alt_address])
+                        
+                        assert len(result) == 1
+                        assert result[0] == mock_alt_account
+                        mock_alt_ctor.assert_called_once_with(pubkey, mock_table.addresses)

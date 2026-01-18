@@ -73,7 +73,15 @@ cp env.example .env
 Main parameters (see `env.example` for complete list):
 
 ```env
-# Solana RPC
+# Solana RPC Configuration
+# RPC URL selection by mode:
+# - scan: uses RPC_URL_SCAN (free/public RPC, doesn't consume trial credits)
+# - simulate/live: uses RPC_URL_PRIMARY (trial/premium RPC) with automatic failover to RPC_URL_FALLBACK
+RPC_URL_SCAN=https://api.mainnet-beta.solana.com  # For scan mode (free/public)
+RPC_URL_PRIMARY=  # Required for simulate/live modes (trial/premium RPC)
+RPC_URL_FALLBACK=  # Optional fallback for simulate/live modes
+
+# Deprecated: RPC_URL (kept for backward compatibility)
 RPC_URL=https://api.mainnet-beta.solana.com
 
 # Operation Mode

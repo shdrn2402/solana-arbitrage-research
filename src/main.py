@@ -209,7 +209,36 @@ async def main(mode: str = 'scan'):
     config = load_config()
     
     # Environment variables
-    rpc_url = os.getenv('RPC_URL', 'https://api.mainnet-beta.solana.com')
+    # RPC URL selection by mode
+    # Scan mode: use RPC_URL_SCAN (free/public, doesn't consume trial credits)
+    # Simulate/Live modes: use RPC_URL_PRIMARY (trial/premium) with failover to RPC_URL_FALLBACK
+    rpc_url_scan = os.getenv('RPC_URL_SCAN', os.getenv('RPC_URL', 'https://api.mainnet-beta.solana.com'))
+    rpc_url_primary = os.getenv('RPC_URL_PRIMARY')
+    rpc_url_fallback = os.getenv('RPC_URL_FALLBACK')
+    
+    # Select RPC URL based on mode
+    if mode == 'scan':
+        rpc_url = rpc_url_scan
+        logger.debug(f"Using scan RPC: {rpc_url_scan.split('//')[1].split('/')[0] if '//' in rpc_url_scan else rpc_url_scan}")
+    elif mode in ('simulate', 'live'):
+        if not rpc_url_primary:
+            logger.error(
+                f"{colors['RED']}RPC_URL_PRIMARY is required for {mode} mode{colors['RESET']}. "
+                f"Please set RPC_URL_PRIMARY in .env file."
+            )
+            return
+        rpc_url = rpc_url_primary
+        if rpc_url_fallback:
+            logger.debug(
+                f"Using primary RPC: {rpc_url_primary.split('//')[1].split('/')[0] if '//' in rpc_url_primary else rpc_url_primary} "
+                f"(fallback: {rpc_url_fallback.split('//')[1].split('/')[0] if '//' in rpc_url_fallback else rpc_url_fallback})"
+            )
+        else:
+            logger.debug(f"Using primary RPC: {rpc_url_primary.split('//')[1].split('/')[0] if '//' in rpc_url_primary else rpc_url_primary} (no fallback)")
+    else:
+        # Fallback to scan RPC for unknown modes
+        rpc_url = rpc_url_scan
+    
     # Jupiter API URL: if not set, client will use fallback mechanism
     # If set explicitly, that URL will be used (no fallback)
     jupiter_api_url = os.getenv('JUPITER_API_URL')  # None = use fallback
@@ -320,7 +349,11 @@ async def main(mode: str = 'scan'):
         backoff_base_seconds=jupiter_backoff_base,
         backoff_max_seconds=jupiter_backoff_max
     )
-    solana = SolanaClient(rpc_url, wallet)
+    # Create SolanaClient with failover support for simulate/live modes
+    if mode in ('simulate', 'live') and rpc_url_fallback:
+        solana = SolanaClient(rpc_url, wallet, fallback_rpc_url=rpc_url_fallback)
+    else:
+        solana = SolanaClient(rpc_url, wallet)
     
     # Try to fetch SOL price from Jupiter API
     sol_price_auto = await jupiter.get_sol_price_usdc(slippage_bps=10)
