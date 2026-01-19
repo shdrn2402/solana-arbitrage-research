@@ -41,22 +41,24 @@ class RouteNegativeCache:
     TTL-based negative cache for unstable Jupiter routes.
     
     Caches routes that fail with:
-    - 6024 + SharedAccountsRoute error
+    - Runtime 6024 + SharedAccountsRoute error (InstructionErrorCustom(6024))
     - Atomic VT size overflow (> 1232 bytes)
     
     to avoid repeated simulate/RPC calls for the same failing route.
     """
     
-    def __init__(self, ttl_seconds: int = 600, ttl_size_overflow_seconds: int = 600):
+    def __init__(self, ttl_seconds: int = 600, ttl_size_overflow_seconds: int = 600, ttl_runtime_6024_seconds: int = 600):
         """
         Initialize negative cache.
         
         Args:
-            ttl_seconds: Time-to-live for 6024 error cache entries (default: 600 = 10 minutes)
+            ttl_seconds: Time-to-live for legacy 6024 error cache entries (default: 600 = 10 minutes, deprecated)
             ttl_size_overflow_seconds: Time-to-live for size overflow cache entries (default: 600 = 10 minutes)
+            ttl_runtime_6024_seconds: Time-to-live for runtime 6024 + SharedAccountsRoute cache entries (default: 600 = 10 minutes)
         """
         self.ttl_seconds = ttl_seconds
         self.ttl_size_overflow_seconds = ttl_size_overflow_seconds
+        self.ttl_runtime_6024_seconds = ttl_runtime_6024_seconds
         # route_signature -> (failure_type: str, timestamp: float)
         self._cache: Dict[str, Tuple[str, float]] = {}
     
@@ -87,7 +89,7 @@ class RouteNegativeCache:
         
         Args:
             route_signature: Route signature
-            failure_type: Optional failure type filter ("atomic_size_overflow" or "6024_shared_accounts")
+            failure_type: Optional failure type filter ("atomic_size_overflow" or "runtime_6024_shared_accounts")
                           If None, checks for any cached failure type
         
         Returns:
@@ -107,7 +109,12 @@ class RouteNegativeCache:
         age = current_time - timestamp
         
         # Select TTL based on failure type
-        ttl = self.ttl_size_overflow_seconds if cached_failure_type == "atomic_size_overflow" else self.ttl_seconds
+        if cached_failure_type == "atomic_size_overflow":
+            ttl = self.ttl_size_overflow_seconds
+        elif cached_failure_type == "runtime_6024_shared_accounts":
+            ttl = self.ttl_runtime_6024_seconds
+        else:
+            ttl = self.ttl_seconds  # Legacy/fallback
         
         if age >= ttl:
             # TTL expired, remove entry
@@ -117,20 +124,28 @@ class RouteNegativeCache:
         ttl_remaining = ttl - age
         return True, cached_failure_type, ttl_remaining
     
-    def cache_route(self, route_signature: str, failure_type: str = "6024_shared_accounts") -> None:
+    def cache_route(self, route_signature: str, failure_type: str = "runtime_6024_shared_accounts") -> None:
         """
         Cache a route with current timestamp and failure type.
         
         Args:
             route_signature: Route signature
-            failure_type: Failure type ("atomic_size_overflow" or "6024_shared_accounts")
+            failure_type: Failure type ("atomic_size_overflow" or "runtime_6024_shared_accounts")
         """
         # Don't overwrite existing entry - TTL is counted from first detection
         if route_signature in self._cache:
             return
         
         self._cache[route_signature] = (failure_type, time.monotonic())
-        ttl = self.ttl_size_overflow_seconds if failure_type == "atomic_size_overflow" else self.ttl_seconds
+        
+        # Select TTL based on failure type
+        if failure_type == "atomic_size_overflow":
+            ttl = self.ttl_size_overflow_seconds
+        elif failure_type == "runtime_6024_shared_accounts":
+            ttl = self.ttl_runtime_6024_seconds
+        else:
+            ttl = self.ttl_seconds  # Legacy/fallback
+        
         logger.info(f"Negative-cache route for TTL={ttl}s (type={failure_type}): {route_signature}")
     
     def cleanup_expired(self) -> int:
@@ -143,7 +158,14 @@ class RouteNegativeCache:
         current_time = time.monotonic()
         expired = []
         for sig, (failure_type, timestamp) in self._cache.items():
-            ttl = self.ttl_size_overflow_seconds if failure_type == "atomic_size_overflow" else self.ttl_seconds
+            # Select TTL based on failure type
+            if failure_type == "atomic_size_overflow":
+                ttl = self.ttl_size_overflow_seconds
+            elif failure_type == "runtime_6024_shared_accounts":
+                ttl = self.ttl_runtime_6024_seconds
+            else:
+                ttl = self.ttl_seconds  # Legacy/fallback
+            
             if (current_time - timestamp) >= ttl:
                 expired.append(sig)
         for sig in expired:
@@ -178,9 +200,11 @@ class Trader:
         self.slippage_bps = slippage_bps
         self.tokens_map = tokens_map or {}
         negative_cache_ttl_size_overflow_sec = int(os.getenv('NEGATIVE_CACHE_TTL_SIZE_OVERFLOW_SEC', '600'))
+        negative_cache_ttl_runtime_6024_sec = int(os.getenv('NEGATIVE_CACHE_TTL_RUNTIME_6024_SEC', '600'))
         self.negative_cache = RouteNegativeCache(
             ttl_seconds=negative_cache_ttl_sec,
-            ttl_size_overflow_seconds=negative_cache_ttl_size_overflow_sec
+            ttl_size_overflow_seconds=negative_cache_ttl_size_overflow_sec,
+            ttl_runtime_6024_seconds=negative_cache_ttl_runtime_6024_sec
         )
     
     async def scan_opportunities(
@@ -458,6 +482,18 @@ class Trader:
                 )
                 return False, "skipped_by_size_cache", None, None
             
+            # Check negative cache for runtime 6024 BEFORE simulate (only if useSharedAccounts is True)
+            if use_shared_accounts:
+                is_cached, cached_failure_type, ttl_remaining = self.negative_cache.is_cached(
+                    route_signature, failure_type="runtime_6024_shared_accounts"
+                )
+                if is_cached and cached_failure_type == "runtime_6024_shared_accounts":
+                    logger.info(
+                        f"Skipping route by runtime-6024 cache (ttl_remaining={ttl_remaining:.1f}s): "
+                        f"{cycle_display}"
+                    )
+                    return False, "skipped_by_runtime_6024_cache", None, None
+            
             # Build atomic VersionedTransaction (with pre-fetched instructions to avoid duplicate API calls)
             vt, min_last_valid_block_height, fail_reason, fail_meta = await self._build_atomic_cycle_vt(
                 opportunity, user_pubkey, leg_instructions=leg_instructions
@@ -505,9 +541,31 @@ class Trader:
                 return False, f"Simulation failed (invalid result type: {type(sim_result).__name__})", None, None
             
             if sim_result.get("err"):
+                # Check for runtime 6024 + SharedAccountsRoute (STRICT criteria)
+                err = sim_result.get("err")
+                logs = sim_result.get("logs", []) or []
+                
+                # Check if error contains 6024 or 0x1788
+                err_str = str(err).lower()
+                has_6024 = "6024" in err_str or "0x1788" in err_str
+                
+                # Check if logs contain "Instruction: SharedAccountsRoute"
+                has_shared_accounts_route = any("Instruction: SharedAccountsRoute" in line for line in logs if isinstance(line, str))
+                
+                # Cache ONLY if: 6024 error + SharedAccountsRoute in logs + useSharedAccounts is True
+                if has_6024 and has_shared_accounts_route and use_shared_accounts:
+                    # Cache the route for TTL
+                    self.negative_cache.cache_route(route_signature, failure_type="runtime_6024_shared_accounts")
+                    ttl = self.negative_cache.ttl_runtime_6024_seconds
+                    
+                    logger.info(
+                        f"Runtime 6024 SharedAccountsRoute -> caching route (ttl={ttl}s): "
+                        f"{cycle_display}"
+                    )
+                    return False, "runtime_6024_shared_accounts", sim_result, None
+                
                 # Include simulation logs in error message for debugging
                 err_msg = f"Simulation error: {sim_result['err']}"
-                logs = sim_result.get("logs", [])
                 if logs:
                     log_tail = self._format_sim_logs(logs, tail=20)
                     err_msg += f"\nSimulation logs (last 20):\n{log_tail}"
