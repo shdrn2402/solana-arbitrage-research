@@ -9,6 +9,7 @@ import uuid
 import base64
 import hashlib
 from typing import Optional, Dict, Any, Tuple, List, Set
+from dataclasses import dataclass
 
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
@@ -34,6 +35,109 @@ from .utils import get_terminal_colors
 colors = get_terminal_colors()
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PreparedBundle:
+    """
+    Prepared bundle containing everything needed for live execution.
+    
+    CRITICAL: The VersionedTransaction MUST be fully assembled AND SIGNED
+    with valid signatures, ready for immediate network submission.
+    No "sign later", "wallet will sign before send", or "add signatures later".
+    
+    After successful send, the bundle is considered "consumed" and must not be reused.
+    """
+    opportunity: ArbitrageOpportunity  # Opportunity with quotes, amounts, dex1/dex2
+    leg_instructions: List[JupiterSwapInstructionsResponse]  # Exactly 2 swap instructions (already obtained)
+    route_signature: str  # Route signature for negative cache
+    min_last_valid_block_height: Optional[int]  # Minimum last valid block height from VT build
+    versioned_transaction: VersionedTransaction  # Fully assembled AND SIGNED VT (v0 + ALTs), ready for immediate send
+    meta: Dict[str, Any]  # Optional metadata: raw_size_bytes, alts_count, plan_id, etc.
+    
+    def __post_init__(self):
+        """Validate bundle integrity."""
+        if len(self.leg_instructions) != 2:
+            raise ValueError(f"PreparedBundle must have exactly 2 leg_instructions, got {len(self.leg_instructions)}")
+        if not isinstance(self.versioned_transaction, VersionedTransaction):
+            raise ValueError(f"PreparedBundle.versioned_transaction must be VersionedTransaction, got {type(self.versioned_transaction)}")
+        # Verify VT is signed (has signatures)
+        if not self.versioned_transaction.signatures or len(self.versioned_transaction.signatures) == 0:
+            raise ValueError("PreparedBundle.versioned_transaction must be signed (have signatures)")
+
+
+def _extract_dex_from_quote(quote) -> str:
+    """
+    Extract DEX name from quote's routePlan.
+    
+    For 1-hop routes, extracts ammKey from the single hop's swapInfo.
+    
+    Args:
+        quote: JupiterQuote with routePlan
+    
+    Returns:
+        DEX name (shortened) or "Unknown" if not found
+    """
+    route_plan = quote.route_plan or []
+    if not route_plan or len(route_plan) == 0:
+        return "Unknown"
+    
+    # For 1-hop routes, take the first (and only) hop
+    hop = route_plan[0] if isinstance(route_plan, list) else None
+    if not isinstance(hop, dict):
+        return "Unknown"
+    
+    swap_info = hop.get('swapInfo', {})
+    amm_key = swap_info.get('ammKey') or hop.get('ammKey', '')
+    
+    if not amm_key:
+        return "Unknown"
+    
+    # Map common AMM keys to readable names
+    amm_map = {
+        '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8': 'Raydium',
+        '9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP': 'Orca',
+        'whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc': 'Orca Whirlpool',
+        'CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK': 'Raydium CLMM',
+    }
+    
+    # Try to find readable name, otherwise use first 8 chars of ammKey
+    dex_name = amm_map.get(amm_key, amm_key[:8] + '...')
+    return dex_name
+
+
+def _format_execution_plan_with_dex(opportunity: ArbitrageOpportunity, tokens_map: Dict[str, str]) -> str:
+    """
+    Format execution plan with DEX per leg: "USDC->SOL (Raydium) -> USDC (Orca)"
+    
+    Args:
+        opportunity: ArbitrageOpportunity with execution_plan and quotes
+        tokens_map: Mapping from mint address to token symbol
+    
+    Returns:
+        Formatted string with tokens and DEX per leg
+    """
+    plan = opportunity.execution_plan
+    quotes = opportunity.quotes
+    
+    if len(plan.legs) != len(quotes):
+        # Fallback: just show cycle without DEX
+        return ' -> '.join(tokens_map.get(addr, addr[:8]) for addr in plan.cycle_mints)
+    
+    parts = []
+    for i, (leg, quote) in enumerate(zip(plan.legs, quotes)):
+        from_symbol = tokens_map.get(leg.from_mint, leg.from_mint[:8])
+        to_symbol = tokens_map.get(leg.to_mint, leg.to_mint[:8])
+        dex = _extract_dex_from_quote(quote)
+        
+        if i == 0:
+            # First leg: show from -> to (DEX)
+            parts.append(f"{from_symbol}->{to_symbol} ({dex})")
+        else:
+            # Subsequent legs: show -> to (DEX)
+            parts.append(f"->{to_symbol} ({dex})")
+    
+    return ' '.join(parts)
 
 
 class RouteNegativeCache:
@@ -67,21 +171,30 @@ class RouteNegativeCache:
         cycle_mints: str,
         legs_count: int,
         use_shared_accounts: bool,
-        program_ids_fingerprint: str
+        dex1: str = "Unknown",
+        dex2: str = "Unknown",
+        direction: str = "Unknown->Unknown",
+        program_ids_fingerprint: str = ""
     ) -> str:
         """
         Generate route signature from route characteristics.
         
+        Plan identification includes DEX pairs (REQUIRED):
+        - Plan USDC→SOL→USDC with Ray→Orca ≠ Plan USDC→SOL→USDC with Orca→Ray
+        
         Args:
-            cycle_mints: Cycle mints string (e.g., "USDC->RAY->SOL->USDC")
-            legs_count: Number of legs (quotes count)
-            use_shared_accounts: Whether useSharedAccounts was used
+            cycle_mints: Cycle mints string (e.g., "USDC->SOL->USDC")
+            legs_count: Number of legs (quotes count, always 2 for 2-swap)
+            use_shared_accounts: Whether useSharedAccounts was used (always False for 2-swap)
+            dex1: DEX for leg1 (e.g., "Raydium")
+            dex2: DEX for leg2 (e.g., "Orca")
+            direction: DEX direction string (e.g., "Raydium->Orca")
             program_ids_fingerprint: Comma-separated program IDs
         
         Returns:
-            Route signature string
+            Route signature string: "cycle_mints|legs_count|useSharedAccounts|dex1|dex2|direction|program_ids_fingerprint"
         """
-        return f"{cycle_mints}|{legs_count}|{use_shared_accounts}|{program_ids_fingerprint}"
+        return f"{cycle_mints}|{legs_count}|{use_shared_accounts}|{dex1}|{dex2}|{direction}|{program_ids_fingerprint}"
     
     def is_cached(self, route_signature: str, failure_type: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[float]]:
         """
@@ -232,7 +345,11 @@ class Trader:
         count_color = colors['GREEN'] if count > 0 else colors['RED']
         logger.info(f"Found {count_color}{count}{colors['RESET']} opportunities")
         for i, opp in enumerate(opportunities, 1):
-            cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opp.cycle)
+            # Format execution plan with DEX per leg (if quotes available)
+            if opp.quotes and len(opp.quotes) == 2:
+                cycle_display = _format_execution_plan_with_dex(opp, self.tokens_map)
+            else:
+                cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opp.cycle)
             logger.info(
                 f"  {i}. Cycle: {cycle_display} | "
                 f"Profit: {opp.profit_bps} bps (${opp.profit_usd:.4f}) | "
@@ -262,6 +379,7 @@ class Trader:
         Returns:
             Number of successful executions
         """
+        # Format cycle (backward compatibility for process_opportunity_with_retries)
         cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
         logger.info(f"Processing opportunity with retries: {colors['CYAN']}{cycle_display}{colors['RESET']} (mode: {colors['CYAN']}{self.mode}{colors['RESET']})")
         success_count = 0
@@ -274,9 +392,23 @@ class Trader:
                 opportunity = original_opportunity
                 logger.debug("Using original opportunity for first attempt (zero-recheck)")
             else:
-                # Check cycle again (3 requests, no delays for fast checking) for retries
+                # Recheck execution_plan with same constraints (2-swap, 1-hop per leg, useSharedAccounts=False)
+                # Use execution_plan from original_opportunity to preserve constraints
+                if original_opportunity and original_opportunity.execution_plan:
+                    execution_plan = original_opportunity.execution_plan
+                else:
+                    # Fallback: reconstruct execution_plan from cycle (backward compatibility)
+                    from .arbitrage_finder import ExecutionLeg, ExecutionPlan
+                    if len(cycle) == 3:  # 2-leg cycle: [A, B, A]
+                        leg1 = ExecutionLeg(from_mint=cycle[0], to_mint=cycle[1], max_hops=1)
+                        leg2 = ExecutionLeg(from_mint=cycle[1], to_mint=cycle[2], max_hops=1)
+                        execution_plan = ExecutionPlan(cycle_mints=cycle, legs=[leg1, leg2], atomic=True, use_shared_accounts=False)
+                    else:
+                        logger.error(f"Invalid cycle length for retry: {len(cycle)} (expected 3 for 2-swap)")
+                        break
+                
                 recheck_start = time.monotonic()
-                opportunity = await self.finder._check_cycle(cycle, amount, skip_delays=True)
+                opportunity = await self.finder._check_execution_plan(execution_plan, amount)
                 recheck_duration_ms = (time.monotonic() - recheck_start) * 1000
                 
                 if not opportunity or not opportunity.is_valid(
@@ -308,6 +440,7 @@ class Trader:
                 success, error, sim_result, swap_response = await self.simulate_opportunity(opportunity, user_pubkey)
                 if success:
                     success_count += 1
+                    # Format cycle (backward compatibility for process_opportunity_with_retries)
                     cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
                     
                     # Format initial/final amounts based on starting token
@@ -338,6 +471,7 @@ class Trader:
                 success, error, tx_sig = await self.execute_opportunity(opportunity, user_pubkey)
                 if success:
                     success_count += 1
+                    # Format cycle (backward compatibility for process_opportunity_with_retries)
                     cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in cycle)
                     
                     # Format initial/final amounts based on starting token
@@ -429,7 +563,8 @@ class Trader:
         Returns:
             (success: bool, error_message: Optional[str], simulation_result: Optional[Dict], swap_response: Optional[JupiterSwapResponse])
         """
-        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        # Format execution plan with DEX per leg
+        cycle_display = _format_execution_plan_with_dex(opportunity, self.tokens_map)
         legs_count = len(opportunity.quotes)
         
         logger.info(
@@ -463,8 +598,8 @@ class Trader:
                     return False, f"Error getting instructions for leg {i+1}: {e}", None, None
             
             # Form full route signature for negative cache check
-            # useSharedAccounts is True by default in get_swap_instructions (see jupiter_client.py line 650)
-            use_shared_accounts = True
+            # useSharedAccounts is False for 2-swap cross-AMM (hard requirement)
+            use_shared_accounts = False
             route_signature = self._get_route_signature(
                 opportunity=opportunity,
                 leg_instructions=leg_instructions,
@@ -633,7 +768,8 @@ class Trader:
         if self.trade_in_progress:
             return False, "Another trade is already in progress. Wait for completion.", None
         
-        cycle_display = ' -> '.join(self.tokens_map.get(addr, addr) for addr in opportunity.cycle)
+        # Format execution plan with DEX per leg
+        cycle_display = _format_execution_plan_with_dex(opportunity, self.tokens_map)
         legs_count = len(opportunity.quotes) if opportunity.quotes else 0
         
         if not opportunity.quotes:
@@ -760,6 +896,162 @@ class Trader:
         
         finally:
             # ALWAYS release trade_in_progress flag and clean up position
+            self.trade_in_progress = False
+    
+    async def execute_prepared_bundle(
+        self,
+        bundle: PreparedBundle,
+        user_pubkey: str
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Execute a PreparedBundle (proof→action: use the exact VT that was simulated).
+        
+        CRITICAL: Uses the exact VersionedTransaction from bundle (already signed, ready for send).
+        Rebuild is ONLY allowed for expiry (with headroom check).
+        
+        Args:
+            bundle: PreparedBundle with fully signed VT ready for immediate send
+            user_pubkey: User's public key (for logging/validation)
+        
+        Returns:
+            (success: bool, error_message: Optional[str], tx_signature: Optional[str])
+        """
+        # STRICT MODE CHECK: Only 'live' mode can send transactions
+        if self.mode != 'live':
+            return False, f"Transaction sending disabled in mode '{self.mode}'. Use 'live' mode to send transactions.", None
+        
+        # PARALLEL TRADE PROTECTION: Only one trade at a time
+        if self.trade_in_progress:
+            return False, "Another trade is already in progress. Wait for completion.", None
+        
+        opportunity = bundle.opportunity
+        cycle_display = _format_execution_plan_with_dex(opportunity, self.tokens_map)
+        position_id = str(uuid.uuid4())
+        
+        logger.info(
+            f"{colors['CYAN']}Executing prepared bundle:{colors['RESET']} {colors['YELLOW']}{cycle_display}{colors['RESET']}"
+        )
+        logger.info(f"{colors['CYAN']}Position ID:{colors['RESET']} {colors['YELLOW']}{position_id}{colors['RESET']}")
+        
+        # Set trade_in_progress flag BEFORE any operations
+        self.trade_in_progress = True
+        
+        try:
+            # A) Risk check (token-aware: base_mint is first token in cycle)
+            base_mint = opportunity.cycle[0]
+            can_open, reason = self.risk.can_open_position(
+                base_mint=base_mint,
+                amount_in=opportunity.initial_amount,
+                expected_profit_bps=opportunity.profit_bps,
+                slippage_bps=self.slippage_bps,
+                expected_profit_usdc=opportunity.profit_usd
+            )
+            
+            if not can_open:
+                return False, f"Risk check failed: {reason}", None
+            
+            # Add position
+            self.risk.add_position(
+                position_id,
+                opportunity.cycle[0],
+                opportunity.cycle[-1],
+                opportunity.initial_amount,
+                opportunity.final_amount,
+                base_mint=base_mint
+            )
+            
+            # B) Expiry check with headroom (ONLY reason for rebuild)
+            expiry_rebuild_headroom_blocks = int(os.getenv('EXPIRY_REBUILD_HEADROOM_BLOCKS', '150'))  # Default: 150 blocks (~30s at 4 blocks/sec)
+            current_block_height = await self.solana.get_current_block_height()
+            
+            if current_block_height is None:
+                logger.warning("Failed to get current block height for expiry check, proceeding with bundle VT")
+                vt_to_use = bundle.versioned_transaction
+                rebuild_reason = None
+            elif bundle.min_last_valid_block_height and bundle.min_last_valid_block_height > 0:
+                # Check if expiry is close (within headroom)
+                blocks_remaining = bundle.min_last_valid_block_height - current_block_height
+                if blocks_remaining <= expiry_rebuild_headroom_blocks:
+                    # Expiry rebuild allowed (ONLY exception)
+                    logger.warning(
+                        f"{colors['YELLOW']}Expiry rebuild required:{colors['RESET']} "
+                        f"blocks_remaining={blocks_remaining} <= headroom={expiry_rebuild_headroom_blocks} "
+                        f"(current={current_block_height}, last_valid={bundle.min_last_valid_block_height})"
+                    )
+                    rebuild_reason = "expiry_rebuild"
+                    # Rebuild: get new swap-instructions and build new VT
+                    vt_to_use, min_last_valid_block_height_new, fail_reason, fail_meta = await self._build_atomic_cycle_vt(
+                        opportunity, user_pubkey, leg_instructions=bundle.leg_instructions
+                    )
+                    if vt_to_use is None:
+                        return False, f"Expiry rebuild failed: {fail_reason}", None
+                    # Optional: re-simulate rebuilt VT (mandatory simulate in live)
+                    sim_result_rebuild = await self.solana.simulate_versioned_transaction(vt_to_use)
+                    if sim_result_rebuild is None or not isinstance(sim_result_rebuild, dict) or sim_result_rebuild.get("err"):
+                        return False, f"Expiry rebuild simulation failed: {sim_result_rebuild.get('err') if isinstance(sim_result_rebuild, dict) else 'no result'}", None
+                else:
+                    # Use bundle VT (no rebuild)
+                    vt_to_use = bundle.versioned_transaction
+                    rebuild_reason = None
+                    logger.debug(
+                        f"Using bundle VT: blocks_remaining={blocks_remaining} > headroom={expiry_rebuild_headroom_blocks}"
+                    )
+            else:
+                # No expiry info - use bundle VT
+                vt_to_use = bundle.versioned_transaction
+                rebuild_reason = None
+                logger.debug("No expiry info in bundle, using bundle VT")
+            
+            # C) Optional: Re-simulate bundle VT (mandatory simulate in live, but same VT)
+            # This is allowed as it simulates the exact same VT that was already simulated
+            sim_result = await self.solana.simulate_versioned_transaction(vt_to_use)
+            
+            if sim_result is None:
+                return False, "Simulation failed (no result from RPC)", None
+            
+            if not isinstance(sim_result, dict):
+                return False, f"Simulation failed (invalid result type: {type(sim_result).__name__})", None
+            
+            if sim_result.get("err"):
+                err_msg = f"Simulation failed (MANDATORY): {sim_result['err']}"
+                if rebuild_reason:
+                    err_msg += f" (after {rebuild_reason})"
+                logs = sim_result.get("logs", [])
+                if logs:
+                    log_tail = self._format_sim_logs(logs, tail=20)
+                    err_msg += f"\nSimulation logs (last 20):\n{log_tail}"
+                return False, err_msg, None
+            
+            # D) Send VersionedTransaction (use skip_preflight=True since we already simulated)
+            self.risk.update_position_status(position_id, 'executing')
+            tx_sig = await self.solana.send_versioned_transaction(
+                vt_to_use,
+                skip_preflight=True
+            )
+            
+            if tx_sig is None:
+                return False, "Failed to send transaction", None
+            
+            # Wait for confirmation
+            confirmed = await self.solana.confirm_transaction(tx_sig, timeout=30.0)
+            
+            if confirmed:
+                self.risk.update_position_status(position_id, 'completed')
+                if rebuild_reason:
+                    logger.info(f"{colors['YELLOW']}Transaction sent (after {rebuild_reason}){colors['RESET']}: {colors['CYAN']}{tx_sig}{colors['RESET']}")
+                return True, None, tx_sig
+            else:
+                self.risk.update_position_status(position_id, 'failed')
+                return False, "Transaction not confirmed", tx_sig
+            
+        except Exception as e:
+            logger.error(f"Error executing prepared bundle: {e}", exc_info=True)
+            if position_id in self.risk.active_positions:
+                self.risk.update_position_status(position_id, 'failed')
+            return False, str(e), None
+        
+        finally:
+            # Always reset trade_in_progress flag
             self.trade_in_progress = False
             # Removed artificial delay - no sleep in hot path for live mode
             self.risk.remove_position(position_id)
@@ -906,26 +1198,35 @@ class Trader:
         self,
         opportunity: ArbitrageOpportunity,
         leg_instructions: Optional[List[JupiterSwapInstructionsResponse]] = None,
-        use_shared_accounts: bool = True
+        use_shared_accounts: bool = False
     ) -> str:
         """
         Generate route signature for negative cache.
         
+        Plan identification includes DEX pairs (REQUIRED):
+        - Plan USDC→SOL→USDC with Ray→Orca ≠ Plan USDC→SOL→USDC with Orca→Ray
+        
         Args:
-            opportunity: ArbitrageOpportunity
-            leg_instructions: Optional list of JupiterSwapInstructionsResponse (for multi-leg)
-            use_shared_accounts: Whether useSharedAccounts was used (default: True)
+            opportunity: ArbitrageOpportunity with execution_plan (must have dex1, dex2 set)
+            leg_instructions: Optional list of JupiterSwapInstructionsResponse (exactly 2 for 2-swap)
+            use_shared_accounts: Whether useSharedAccounts was used (always False for 2-swap)
         
         Returns:
-            Route signature string
+            Route signature string: "cycle_mints|legs_count|useSharedAccounts|dex1|dex2|direction|program_ids_fingerprint"
         """
-        # Cycle mints string
-        cycle_mints = "->".join(opportunity.cycle)
+        # Cycle mints string from execution_plan
+        cycle_mints = "->".join(opportunity.execution_plan.cycle_mints)
         
-        # Legs count
+        # Legs count (always 2 for 2-swap)
         legs_count = len(opportunity.quotes)
+        assert legs_count == 2, f"Expected 2 legs for 2-swap, got {legs_count}"
         
-        # Program IDs fingerprint (if available)
+        # DEX pairs from execution_plan (REQUIRED for plan identification)
+        dex1 = opportunity.execution_plan.dex1 or "Unknown"
+        dex2 = opportunity.execution_plan.dex2 or "Unknown"
+        direction = f"{dex1}->{dex2}"
+        
+        # Program IDs fingerprint (unified for entire execution_plan, if available)
         if leg_instructions:
             program_ids_fingerprint = self._extract_program_ids_fingerprint(leg_instructions)
         else:
@@ -935,6 +1236,9 @@ class Trader:
             cycle_mints=cycle_mints,
             legs_count=legs_count,
             use_shared_accounts=use_shared_accounts,
+            dex1=dex1,
+            dex2=dex2,
+            direction=direction,
             program_ids_fingerprint=program_ids_fingerprint
         )
     
@@ -945,10 +1249,10 @@ class Trader:
         leg_instructions: Optional[List[JupiterSwapInstructionsResponse]] = None
     ) -> Tuple[Optional[VersionedTransaction], Optional[int], Optional[str], Optional[Dict[str, Any]]]:
         """
-        Build atomic VersionedTransaction for 3-leg cycle (all-or-nothing execution).
+        Build atomic VersionedTransaction for 2-swap execution plan (all-or-nothing execution).
         
         Args:
-            opportunity: ArbitrageOpportunity with 3-leg cycle
+            opportunity: ArbitrageOpportunity with 2-swap execution plan
             user_pubkey: User's public key (base58)
             leg_instructions: Optional pre-fetched swap instructions (to avoid duplicate API calls)
         
@@ -957,18 +1261,18 @@ class Trader:
             fail_reason: "atomic_size_overflow" for size > 1232 bytes, "build_failed" for other errors, None for success
             fail_meta: Dict with failure details (raw_size_bytes, max_size_bytes, instr_count, alts_count for overflow)
         """
-        # Validate cycle length (must be 3-leg: 4 tokens, 3 quotes)
-        if len(opportunity.cycle) != 4:
+        # Validate cycle length (must be 2-swap: 3 tokens [A, B, A], 2 quotes)
+        if len(opportunity.cycle) != 3:
             logger.error(
                 f"Invalid cycle length for atomic transaction: {len(opportunity.cycle)} "
-                f"(expected 4 for 3-leg cycle)"
+                f"(expected 3 for 2-swap execution plan)"
             )
             return None, None, "build_failed", {"error": "Invalid cycle length"}
         
-        if len(opportunity.quotes) != 3:
+        if len(opportunity.quotes) != 2:
             logger.error(
                 f"Invalid quotes count for atomic transaction: {len(opportunity.quotes)} "
-                f"(expected 3 for 3-leg cycle)"
+                f"(expected 2 for 2-swap execution plan)"
             )
             return None, None, "build_failed", {"error": "Invalid quotes count"}
         
@@ -1040,7 +1344,7 @@ class Trader:
         # Build instruction list in order:
         # A) ComputeBudget (if needed - skip for now, Jupiter handles it)
         # B) Setup instructions (all legs, deduplicated)
-        # C) Swap instructions (leg1 -> leg2 -> leg3)
+        # C) Swap instructions (leg1 -> leg2)
         # D) Cleanup instructions (all legs, deduplicated)
         
         all_setup_instructions: List[Instruction] = []
@@ -1082,7 +1386,8 @@ class Trader:
             logger.error("No instructions to build transaction")
             return None, None, "build_failed", {"error": "No instructions to build transaction"}
         
-        # Get recent blockhash
+        # Get recent blockhash RIGHT BEFORE building VT to minimize time gap
+        # This reduces BlockhashNotFound errors during simulation
         recent_blockhash = await self.solana.get_recent_blockhash()
         if not recent_blockhash:
             logger.error("Failed to get recent blockhash")

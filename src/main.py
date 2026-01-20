@@ -8,7 +8,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 import dotenv
 from solders.keypair import Keypair
@@ -17,7 +17,7 @@ from solders.pubkey import Pubkey
 from .jupiter_client import JupiterClient
 from .solana_client import SolanaClient
 from .risk_manager import RiskManager, RiskConfig
-from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity
+from .arbitrage_finder import ArbitrageFinder, ArbitrageOpportunity, ExecutionPlan, ExecutionLeg
 from .trader import Trader
 from .utils import get_terminal_colors
 
@@ -512,16 +512,46 @@ async def main(mode: str = 'scan'):
             "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",  # BONK
         ]
     
-    # Load cycles from config.json
+    # Load cycles from config.json and convert to execution_plans (2-swap only)
     cycles = config.get('cycles', [])
-    if not cycles:
-        logger.warning("No cycles found in config.json. Please add cycles section to config.json")
+    execution_plans = []
     
-    # Calculate test_amount (will be logged in effective config after calculation)
-    # This is done here to have cycles count available for logging
-    # Note: test_amount calculation happens later, but we'll log it there too
+    for cycle in cycles:
+        # Only accept 2-leg cycles (3 tokens: [A, B, A])
+        if len(cycle) != 3:
+            logger.warning(f"Skipping cycle with length {len(cycle)} (expected 3 for 2-swap): {cycle}")
+            continue
+        
+        # Validate cycle format: [A, B, A]
+        if cycle[0] != cycle[2]:
+            logger.warning(f"Skipping invalid cycle (start != end): {cycle}")
+            continue
+        
+        # Create execution plan with 2 legs
+        leg1 = ExecutionLeg(
+            from_mint=cycle[0],
+            to_mint=cycle[1],
+            max_hops=1  # Hard requirement: 1-hop only
+        )
+        leg2 = ExecutionLeg(
+            from_mint=cycle[1],
+            to_mint=cycle[2],
+            max_hops=1  # Hard requirement: 1-hop only
+        )
+        
+        execution_plan = ExecutionPlan(
+            cycle_mints=cycle,
+            legs=[leg1, leg2],
+            atomic=True,
+            use_shared_accounts=False
+        )
+        
+        execution_plans.append(execution_plan)
     
-    # Initialize arbitrage finder
+    if not execution_plans:
+        logger.warning("No valid 2-swap execution plans found in config.json. Please add cycles with format [A, B, A]")
+    
+    # Initialize arbitrage finder with execution_plans
     arbitrage_config = config.get('arbitrage', {})
     finder = ArbitrageFinder(
         jupiter,
@@ -534,7 +564,7 @@ async def main(mode: str = 'scan'):
         slippage_bps=slippage_bps,
         sol_price_usdc=risk_config.sol_price_usdc,
         quote_delay_seconds=quote_delay_seconds,
-        cycles=cycles
+        execution_plans=execution_plans
     )
     
     # Initialize trader with mode for safety checks
@@ -657,7 +687,7 @@ async def main(mode: str = 'scan'):
         f"TEST_AMOUNT_SOL={colors['GREEN']}{test_amount_sol/1e9:.6f}{colors['RESET']} ({colors['DIM']}{test_amount_sol} lamports{colors['RESET']}), "
         f"TEST_AMOUNT_USDC={colors['GREEN']}{test_amount_usdc/1e6:.2f}{colors['RESET']} ({colors['DIM']}{test_amount_usdc} units{colors['RESET']}), "
         f"QUOTE_DELAY_SECONDS={colors['GREEN']}{quote_delay_seconds}{colors['RESET']}, "
-        f"PATHS_CONFIGURED={colors['GREEN']}{len(cycles)}{colors['RESET']}"
+        f"EXECUTION_PLANS={colors['GREEN']}{len(execution_plans)}{colors['RESET']}"
     )
     
     async def run_nonstop(
@@ -669,7 +699,7 @@ async def main(mode: str = 'scan'):
         risk_manager: RiskManager,
         wallet: Keypair,
         tokens_map: Dict[str, str],
-        cycles: list,
+        execution_plans: list,
         amounts_by_mint: Dict[str, int],
         sol_mint: str,
         usdc_mint: str,
@@ -853,21 +883,137 @@ async def main(mode: str = 'scan'):
                 }
                 risk_manager.update_wallet_balances(balances_by_mint)
                 
-                # Reset fail streak on successful iteration
-                fail_streak = 0
+                # Inline arbitrage iteration (2-swap cross-AMM, atomic, enforced 1-hop)
+                async def on_success_callback(bundle, sim_result: Dict[str, Any]) -> None:
+                    """Callback for successful inline simulations with PreparedBundle."""
+                    from .trader import PreparedBundle  # Import here to avoid circular import
+                    nonlocal usdc_units_last, t_usdc_last
+                    
+                    opp = bundle.opportunity
+                    cycle_display = format_cycle_with_symbols(opp.cycle, tokens_map)
+                    base_mint = opp.cycle[0]
+                    
+                    # Force refresh USDC if this is a USDC-base opportunity and balance is stale
+                    if base_mint == usdc_mint:
+                        t_now = time.monotonic()
+                        age = t_now - t_usdc_last
+                        if age >= balance_force_refresh_usdc_if_older_sec:
+                            logger.debug(f"USDC balance is {age:.1f}s old, forcing refresh after successful simulation")
+                            new_usdc_units = await fetch_usdc_units(
+                                solana, wallet, usdc_mint, balance_refresh_rpc_timeout_sec
+                            )
+                            if new_usdc_units is not None:
+                                usdc_units_last = new_usdc_units
+                                t_usdc_last = t_now
+                                # Update risk manager immediately
+                                balances_by_mint = {
+                                    sol_mint: sol_lamports_last,
+                                    usdc_mint: usdc_units_last
+                                }
+                                risk_manager.update_wallet_balances(balances_by_mint)
+                                logger.debug(f"USDC balance refreshed: {usdc_units_last / 1e6:.2f} USDC")
+                    
+                    # For live mode, execute using PreparedBundle (no rebuild)
+                    if mode == 'live':
+                        try:
+                            success, error_msg, tx_sig = await trader.execute_prepared_bundle(bundle, user_pubkey)
+                            if success:
+                                logger.info(
+                                    f"{colors['GREEN']}✓ Execution SUCCESS{colors['RESET']}: "
+                                    f"{cycle_display} | TX: {colors['CYAN']}{tx_sig}{colors['RESET']}"
+                                )
+                            else:
+                                logger.warning(f"Execution failed: {error_msg}")
+                        except Exception as e:
+                            logger.error(f"Error executing prepared bundle: {e}", exc_info=True)
                 
-                # Find and process opportunities
-                await finder.find_opportunities(
-                    start_token,
-                    test_amount,
-                    max_opportunities=100,  # High limit, callback processes immediately
-                    on_opportunity_found=on_opportunity_found,
-                    amounts_by_mint=amounts_by_mint
+                # Run inline arbitrage iteration (managed, returns to main loop)
+                iteration_stats = await finder.inline_arbitrage_one_iteration(
+                    amounts_by_mint=amounts_by_mint,
+                    trader=trader,
+                    user_pubkey=user_pubkey,
+                    on_success=on_success_callback
                 )
                 
-                # Idle sleep after scanning
-                logger.debug(f"No more opportunities in current cycle, sleeping {loop_idle_sleep_sec}s")
-                await asyncio.sleep(loop_idle_sleep_sec)
+                # Track iteration stats for summary logging
+                if not hasattr(run_nonstop, '_cumulative_stats'):
+                    run_nonstop._cumulative_stats = {
+                        'candidates': 0,
+                        'successes': 0,
+                        'skips': {},
+                        'errors': 0,
+                        'iterations': 0
+                    }
+                    run_nonstop._last_summary_time = time.monotonic()
+                
+                # Accumulate stats
+                run_nonstop._cumulative_stats['iterations'] += 1
+                run_nonstop._cumulative_stats['candidates'] += iteration_stats.get('candidates', 0)
+                run_nonstop._cumulative_stats['successes'] += iteration_stats.get('successes', 0)
+                run_nonstop._cumulative_stats['errors'] += iteration_stats.get('errors', 0)
+                for reason, count in iteration_stats.get('skips', {}).items():
+                    run_nonstop._cumulative_stats['skips'].setdefault(reason, 0)
+                    run_nonstop._cumulative_stats['skips'][reason] += count
+                
+                # Periodic summary log (every 60 seconds)
+                t_now = time.monotonic()
+                summary_interval_sec = float(os.getenv('INLINE_SUMMARY_EVERY_SEC', '60.0'))
+                if (t_now - run_nonstop._last_summary_time) >= summary_interval_sec:
+                    # Log summary
+                    cum = run_nonstop._cumulative_stats
+                    skip_summary = ', '.join([f"{k}:{v}" for k, v in sorted(cum['skips'].items()) if v > 0])
+                    logger.info(
+                        f"{colors['DIM']}Summary ({cum['iterations']} iterations): "
+                        f"{colors['CYAN']}{cum['candidates']}{colors['RESET']} candidates, "
+                        f"{colors['GREEN']}{cum['successes']}{colors['RESET']} successes, "
+                        f"{colors['YELLOW']}{cum['errors']}{colors['RESET']} errors"
+                        + (f" | Skips: {skip_summary}" if skip_summary else "")
+                    )
+                    # Reset cumulative stats
+                    run_nonstop._cumulative_stats = {
+                        'candidates': 0,
+                        'successes': 0,
+                        'skips': {},
+                        'errors': 0,
+                        'iterations': 0
+                    }
+                    run_nonstop._last_summary_time = t_now
+                
+                # Cleanup negative cache (periodic)
+                cleanup_interval_sec = float(os.getenv('NEGATIVE_CACHE_CLEANUP_EVERY_SEC', '60.0'))
+                if not hasattr(run_nonstop, '_last_cleanup_time'):
+                    run_nonstop._last_cleanup_time = t_now
+                
+                if (t_now - run_nonstop._last_cleanup_time) >= cleanup_interval_sec:
+                    removed = trader.negative_cache.cleanup_expired()
+                    if removed > 0:
+                        logger.debug(f"Negative cache cleanup: removed {removed} expired entries")
+                    run_nonstop._last_cleanup_time = t_now
+                
+                # Idle/backoff logic based on clear semantics
+                had_fundable_plans = iteration_stats.get('had_fundable_plans', False)
+                did_any_quote_call = iteration_stats.get('did_any_quote_call', False)
+                
+                if not had_fundable_plans:
+                    # No fundable plans -> long idle sleep
+                    await asyncio.sleep(loop_idle_sleep_sec)
+                    fail_streak = 0  # Reset on idle (no error)
+                elif had_fundable_plans and not did_any_quote_call:
+                    # Anomaly: fundable plans but no quotes called -> backoff (avoid busy loop)
+                    logger.warning(
+                        f"{colors['YELLOW']}Anomaly detected:{colors['RESET']} "
+                        f"had_fundable_plans=True but did_any_quote_call=False. Applying backoff."
+                    )
+                    fail_streak += 1
+                    backoff_sec = min(
+                        fail_backoff_base_sec * (2 ** (fail_streak - 1)),
+                        fail_backoff_max_sec
+                    )
+                    await asyncio.sleep(backoff_sec)
+                else:
+                    # Normal: quotes were called -> short sleep
+                    await asyncio.sleep(0.1)
+                    fail_streak = 0  # Reset on successful iteration
                 
             except KeyboardInterrupt:
                 logger.info("Stopping bot...")
@@ -878,19 +1024,30 @@ async def main(mode: str = 'scan'):
                     fail_backoff_base_sec * (2 ** (fail_streak - 1)),
                     fail_backoff_max_sec
                 )
-                logger.error(
-                    f"{colors['RED']}Error in {mode} loop (streak: {fail_streak}):{colors['RESET']} {e}",
-                    exc_info=True
+                # Log error once with traceback (only unexpected errors)
+                error_msg = str(e)
+                is_expected = (
+                    "timeout" in error_msg.lower() or
+                    "429" in error_msg or
+                    "rate limit" in error_msg.lower() or
+                    "connection" in error_msg.lower()
                 )
+                if is_expected:
+                    logger.warning(f"Expected error in {mode} loop (streak: {fail_streak}): {error_msg}")
+                else:
+                    logger.error(
+                        f"{colors['RED']}Unexpected error in {mode} loop (streak: {fail_streak}):{colors['RESET']} {e}",
+                        exc_info=True
+                    )
                 logger.warning(f"Backing off for {backoff_sec:.1f}s before retry...")
                 await asyncio.sleep(backoff_sec)
     
     try:
         if mode == 'scan':
             logger.info(f"Starting {colors['CYAN']}SCAN (read-only){colors['RESET']} mode")
-            usdc_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" and c[-1] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
-            sol_cycles = sum(1 for c in cycles if len(c) == 4 and c[0] == "So11111111111111111111111111111111111111112" and c[-1] == "So11111111111111111111111111111111111111112")
-            logger.info(f"Optimized scan: paths={len(cycles)} ({usdc_cycles} USDC-based + {sol_cycles} SOL-based, all 3-leg) delay={quote_delay_seconds}s ({len(cycles) * 3} requests in ~{len(cycles) * 3 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
+            usdc_plans = sum(1 for p in execution_plans if p.cycle_mints[0] == "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+            sol_plans = sum(1 for p in execution_plans if p.cycle_mints[0] == "So11111111111111111111111111111111111111112")
+            logger.info(f"Optimized scan: execution_plans={len(execution_plans)} ({usdc_plans} USDC-based + {sol_plans} SOL-based, all 2-swap) delay={quote_delay_seconds}s ({len(execution_plans) * 2} requests in ~{len(execution_plans) * 2 * quote_delay_seconds:.0f}s, rate-limited: {int(60/quote_delay_seconds)} req/min)")
             opportunities = await trader.scan_opportunities(
                 start_token,
                 test_amount,
@@ -1020,7 +1177,7 @@ async def main(mode: str = 'scan'):
                 risk_manager=risk_manager,
                 wallet=wallet,
                 tokens_map=tokens_map,
-                cycles=cycles,
+                execution_plans=execution_plans,
                 amounts_by_mint=amounts_by_mint,
                 sol_mint=sol_mint,
                 usdc_mint=usdc_mint,
@@ -1138,7 +1295,7 @@ async def main(mode: str = 'scan'):
                 risk_manager=risk_manager,
                 wallet=wallet,
                 tokens_map=tokens_map,
-                cycles=cycles,
+                execution_plans=execution_plans,
                 amounts_by_mint=amounts_by_mint,
                 sol_mint=sol_mint,
                 usdc_mint=usdc_mint,

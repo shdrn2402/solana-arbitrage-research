@@ -467,8 +467,8 @@ class JupiterClient:
                 data = response.json()
                 
                 last_valid_block_height = data.get("lastValidBlockHeight", 0)
-                if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
-                    logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
+                if "lastValidBlockHeight" not in data:
+                    logger.debug("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
                 
                 swap_response = JupiterSwapResponse(
                     swap_transaction=data.get("swapTransaction", ""),
@@ -646,9 +646,13 @@ class JupiterClient:
             "dynamicComputeUnitLimit": dynamic_compute_unit_limit,
             # Request instructions instead of full transaction
             "onlyLegs": True,  # This parameter requests instructions only
-            # Enable shared accounts to increase ALT usage
-            "useSharedAccounts": True
+            # Disable shared accounts for 2-swap cross-AMM (hard requirement)
+            "useSharedAccounts": False
         }
+        
+        # For 2-swap cross-AMM: useSharedAccounts is always False (hard requirement)
+        # Do not retry with useSharedAccounts=True even on 400 errors
+        allow_shared_accounts_retry = False
         
         # Add priority fee if specified
         if priority_fee_lamports > 0:
@@ -694,18 +698,22 @@ class JupiterClient:
                 swap_url = f"{base_url}{path}"
                 
                 # Retry on 429 with exponential backoff
-                # Also handle useSharedAccounts fallback (if 400, retry without it)
-                use_shared_accounts = True
+                # For 2-swap: useSharedAccounts is always False (no retry with True)
+                use_shared_accounts = allow_shared_accounts_retry  # False for 2-swap
                 
                 for attempt in range(self.max_retries_on_429 + 1):
                     try:
                         # Apply rate limiting before each HTTP POST
                         await self.rate_limiter.acquire()
                         
-                        # Try with useSharedAccounts first, fallback without it if 400
+                        # Use payload as-is (useSharedAccounts already set to False for 2-swap)
                         current_payload = payload.copy()
-                        if not use_shared_accounts:
-                            # Remove useSharedAccounts if we already tried and it failed
+                        # For 2-swap: never add useSharedAccounts=True (hard requirement)
+                        if not use_shared_accounts and "useSharedAccounts" in current_payload:
+                            # Keep False (already set)
+                            pass
+                        elif not use_shared_accounts:
+                            # Remove if somehow present (shouldn't happen for 2-swap)
                             current_payload.pop("useSharedAccounts", None)
                         
                         response = await self.client.post(swap_url, json=current_payload)
@@ -727,8 +735,8 @@ class JupiterClient:
                             # }
                             
                             last_valid_block_height = data.get("lastValidBlockHeight", 0)
-                            if last_valid_block_height == 0 or "lastValidBlockHeight" not in data:
-                                logger.warning("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
+                            if "lastValidBlockHeight" not in data:
+                                logger.debug("lastValidBlockHeight not found in Jupiter API response, using 0 as default")
                             
                             # Parse setup instructions
                             setup_instructions = []
@@ -798,7 +806,7 @@ class JupiterClient:
                             # Cache successful endpoint + path
                             self._working_swap_endpoint = endpoint
                             
-                            logger.info(
+                            logger.debug(
                                 f"Swap instructions OK via {swap_url}: "
                                 f"{len(setup_instructions)} setup, 1 swap, "
                                 f"{1 if cleanup_instruction else 0} cleanup, "
@@ -861,9 +869,15 @@ class JupiterClient:
                         # Check if endpoint doesn't support instructions-only mode (400 with specific error)
                         elif e.response.status_code == 400:
                             error_text = e.response.text.lower()
-                            # Check if it's useSharedAccounts that's not supported
-                            if use_shared_accounts and ("sharedaccounts" in error_text or "useSharedAccounts" in error_text):
-                                # Retry without useSharedAccounts
+                            # For 2-swap: never retry with useSharedAccounts=True (hard requirement)
+                            # If 400 is about useSharedAccounts and we're already using False, try next path
+                            if not allow_shared_accounts_retry and ("sharedaccounts" in error_text or "useSharedAccounts" in error_text):
+                                # For 2-swap: this shouldn't happen (we always use False)
+                                # But if it does, try next path (don't retry with True)
+                                logger.debug(f"Path {path} on {endpoint} returned 400 about useSharedAccounts (2-swap always uses False), trying next path")
+                                break  # Try next path
+                            elif use_shared_accounts and ("sharedaccounts" in error_text or "useSharedAccounts" in error_text):
+                                # Legacy path: retry without useSharedAccounts (only if allow_shared_accounts_retry=True)
                                 use_shared_accounts = False
                                 logger.debug(f"Path {path} on {endpoint} doesn't support useSharedAccounts, retrying without it")
                                 continue  # Retry with same path but without useSharedAccounts

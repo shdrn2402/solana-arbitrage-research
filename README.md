@@ -8,23 +8,30 @@ This project is an experimental / research prototype developed iteratively.
 
 ### ✅ Stage 1 — Scan (completed)
 - **Stable Jupiter API integration** — reliable quote retrieval via public API
-- **Arbitrage path discovery** — cycles and tokens loaded from config.json
-- **Configurable token universe** — adjustable tokens and cycle depth via config.json
+- **2-swap cross-AMM execution plans** — execution plans with DEX pairs as key identifier
+- **DEX-pair identification** — Plan USDC→SOL→USDC with Ray→Orca ≠ Plan USDC→SOL→USDC with Orca→Ray
+- **Hard 1-hop enforcement** — strictly 1-hop per leg (no multi-hop routes)
+- **Hard liquidity skip** — rejects plans with anomalously weak liquidity (>5% price impact)
+- **Configurable token universe** — adjustable tokens and execution plans via config.json
 - **Quota-optimized scanning** — rate-limited execution (60 requests/minute) with configurable delays
-- **Repository default: 20 fixed 3-leg cycles** — loaded from config.json (14 USDC-based, 6 SOL-based)
-- **Repository default tokens: SOL, USDC, JUP, BONK, WIF, RAY** — 6 tokens configured in config.json
+- **Repository default: 2-swap execution plans** — USDC→SOL→USDC and SOL→USDC→SOL
+- **Repository default tokens: SOL, USDC** — 2 tokens for cross-AMM arbitrage
 - **Read-only mode** — no on-chain execution or fund usage
 
 ### 🛠️ Stage 2 — Simulation (in progress)
+- **Inline arbitrage loop** — infinite inline cycle: quote-filter → immediate simulate (no batches)
+- **Atomic VersionedTransaction v0** — full 2-swap atomic execution (all-or-nothing)
 - **On-chain transaction simulation** via RPC `simulateTransaction` (no real transactions sent)
-- **⚠️ First-leg proxy only** — current implementation simulates only the first leg of the cycle, not full multi-leg arbitrage
+- **useSharedAccounts=False** — hard requirement for 2-swap (no retry with True)
+- **Negative cache** — TTL-based cache for size overflow and runtime 6024 errors
 - **Priority fee & latency experiments**
 - **Execution feasibility analysis**
 
 ### 🧪 Stage 3 — Live Execution (experimental)
+- **Atomic VersionedTransaction v0** — full 2-swap atomic execution (all-or-nothing)
 - **Real transaction submission** to Solana network
-- **⚠️ First-leg proxy only** — current implementation executes only the first leg of the cycle, not full multi-leg arbitrage
-- **⚠️ Not full-cycle arbitrage** — atomic multi-leg transactions not yet implemented
+- **Mandatory simulation** before execution
+- **useSharedAccounts=False** — hard requirement for 2-swap
 - **Optional Jito integration**
 - **Research-only, not production-ready**
 
@@ -94,8 +101,10 @@ WALLET_PRIVATE_KEY=your_private_key_here
 # Risk Management (all absolute limits in USDC)
 MAX_POSITION_SIZE_PERCENT=10.0  # Maximum position size (% of balance)
 MAX_POSITION_SIZE_ABSOLUTE=1.0  # in SOL
-MIN_PROFIT_USDC=0.03  # PRIMARY: minimum profit in USDC
-MIN_PROFIT_BPS=0  # SECONDARY: optional filter (set to 0 to disable)
+# For first night run: use softer thresholds to see regular simulate_success
+# After first night: raise thresholds based on hit-rate statistics
+MIN_PROFIT_USDC=0.03  # PRIMARY: minimum profit in USDC (softened for first night, was 0.1)
+MIN_PROFIT_BPS=5  # SECONDARY: optional filter in basis points (softened for first night, was 50, set to 0 to disable)
 MAX_SLIPPAGE_BPS=200  # Maximum allowed slippage (risk limit)
 SLIPPAGE_BPS=100  # Actual slippage used in Jupiter API requests
 MAX_ACTIVE_POSITIONS=1
@@ -179,7 +188,38 @@ Intended for research and testing purposes:
 python run.py simulate
 ```
 
-**⚠️ Important:** Current implementation simulates only the first leg of the cycle as a proxy, not full multi-leg arbitrage. This is because Jupiter API doesn't support multi-leg swaps directly, and building atomic multi-leg transactions is not yet implemented.
+**Implementation:** Uses managed inline arbitrage loop with full 2-swap atomic execution. The bot runs in controlled iterations, allowing periodic balance/price refresh and proper error handling:
+
+1. **Main loop** (`run_nonstop`): Iterates continuously, refreshing balances and SOL price on schedule
+2. **Arbitrage iteration** (`inline_arbitrage_one_iteration`): One pass through all execution plans:
+   - Gets quotes for both legs with enforced 1-hop (rate-limited: 1 req/sec)
+   - Validates cross-AMM requirement (DEX1 ≠ DEX2) - **unified invariant across all paths**
+   - Gets swap-instructions in burst mode (no rate limit for candidate-phase)
+   - Builds atomic VersionedTransaction v0 for full 2-swap execution (already signed)
+   - Simulates inline (no batches, no queues)
+   - Creates `PreparedBundle` with fully signed VT ready for immediate live execution
+   - Logs successful simulations
+3. **Periodic maintenance**:
+   - Summary logs every 60 seconds (configurable via `INLINE_SUMMARY_EVERY_SEC`)
+   - Negative cache cleanup every 60 seconds (configurable via `NEGATIVE_CACHE_CLEANUP_EVERY_SEC`)
+   - Idle sleep when no fundable plans (`LOOP_IDLE_SLEEP_SEC`)
+   - Exponential backoff on anomalies (`FAIL_BACKOFF_BASE_SEC`, `FAIL_BACKOFF_MAX_SEC`)
+
+**Proof→Action guarantee (live mode):**
+- `PreparedBundle` contains the exact signed VT that was successfully simulated
+- Live execution uses the bundle VT directly (no rebuild)
+- **Expiry rebuild exception**: Only allowed when `blocks_remaining <= EXPIRY_REBUILD_HEADROOM_BLOCKS` (default: 150 blocks ~30s)
+- This ensures we execute exactly what we simulated (except for expiry protection)
+
+**Logging improvements:**
+- Reduced spam: balance updates and swap-instructions logs moved to DEBUG level
+- Aggregated summary: periodic statistics on candidates, successes, errors, and skip reasons
+- Expected vs unexpected errors: timeout/429 errors logged without traceback
+
+**Clear loop semantics:**
+- `had_fundable_plans`: At least one plan with balance > 0
+- `did_any_quote_call`: At least one Jupiter quote was actually called
+- Idle logic: No fundable plans → long sleep; Fundable but no quotes → backoff (anomaly); Quotes called → short sleep
 
 Required:
 - Configured `WALLET_PRIVATE_KEY` in .env
@@ -213,6 +253,7 @@ Runs a single direct quote request to verify that the aggregator API
 can build swap routes, then exits immediately.
 
 ```bash
+# Enable diagnostic behavior via env
 DIAGNOSTIC_MODE=true python run.py scan
 ```
 
@@ -262,14 +303,55 @@ src/
 
 ## How It Works
 
+### Scan Mode (Read-only)
+
 1. **Opportunity search** (`arbitrage_finder.py`)
-   - Loads cycles and tokens from `config.json` (repository default: 20 fixed 3-leg cycles, 6 tokens)
-   - Evaluates 3-leg exchange cycles (A → B → C → A format)
+   - Loads execution plans from `config.json` (repository default: 2 execution plans: USDC→SOL→USDC, SOL→USDC→SOL)
+   - Evaluates 2-swap cross-AMM execution plans (A → B → A format)
    - Rate-limited to 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
-   - Gets quotes via Jupiter Quote API (burst mode: all legs of a cycle queried quickly, then delay)
+   - Gets quotes via Jupiter Quote API with `onlyDirectRoutes=True` (enforced 1-hop per leg)
+   - Hard 1-hop enforcement: validates `routePlan` contains exactly 1 hop matching leg mints
+   - Hard liquidity skip: rejects plans with >5% price impact (anomalously weak liquidity)
    - Calculates profit accounting for fees and slippage
    - Filters by PRIMARY: `MIN_PROFIT_USDC` (always applied) and SECONDARY: `MIN_PROFIT_BPS` (optional, set to 0 to disable)
-   - Execution time: ~60 seconds per full pass + overhead (20 cycles × 3 requests = 60 requests with 1.0s delay)
+   - DEX-pair identification: extracts DEX from each quote and identifies plan by (cycle_mints, dex1, dex2, direction)
+   - **Hard gate**: Rejects plans where DEX1 == DEX2 or DEX1/DEX2 == "Unknown" (cross-AMM invariant - unified across scan/stream/recheck/inline)
+
+### Simulate/Live Modes (Managed Inline Arbitrage Loop)
+
+1. **Main loop** (`main.py::run_nonstop`)
+   - Controlled iterations (not infinite loop)
+   - Periodic balance refresh (SOL every `BALANCE_REFRESH_SOL_EVERY_SEC`, USDC every `BALANCE_REFRESH_USDC_EVERY_SEC`)
+   - Periodic SOL price refresh (every `SOL_PRICE_REFRESH_EVERY_SEC`)
+   - Idle sleep when no work (`LOOP_IDLE_SLEEP_SEC`)
+   - Exponential backoff on errors (`FAIL_BACKOFF_BASE_SEC`, `FAIL_BACKOFF_MAX_SEC`)
+   - Periodic summary logs (`INLINE_SUMMARY_EVERY_SEC`)
+   - Periodic negative cache cleanup (`NEGATIVE_CACHE_CLEANUP_EVERY_SEC`)
+
+2. **Arbitrage iteration** (`arbitrage_finder.py::inline_arbitrage_one_iteration`)
+   - One pass through all execution plans (returns to main loop)
+   - For each execution plan:
+     - Quote leg1 with `onlyDirectRoutes=True` → enforce 1-hop check → extract DEX1 (rate-limited: 1 req/sec)
+     - Quote leg2 with `onlyDirectRoutes=True` → enforce 1-hop check → extract DEX2 (rate-limited: 1 req/sec)
+     - **Hard gate**: Reject if DEX1 == DEX2 or DEX1/DEX2 == "Unknown" (cross-AMM invariant - unified across all paths)
+     - Edge-gate: profit check (MIN_PROFIT_USDC, MIN_PROFIT_BPS)
+     - Get swap-instructions for both legs **in burst mode** (no rate limit for candidate-phase)
+     - Build route_signature (cycle_mints, legs_count=2, useSharedAccounts=False, program_ids_fingerprint)
+     - Negative-cache check (atomic_size_overflow) → SKIP if cached
+     - Build atomic VersionedTransaction v0 (already signed)
+     - If size overflow → cache route (TTL 600s) → SKIP
+     - Simulate inline (no delays, no batches)
+     - On success → create `PreparedBundle` (with signed VT) → call callback
+   - Returns statistics: candidates, successes, skips (by reason), errors, had_fundable_plans, did_any_quote_call, did_candidate_flow
+   - Rate limiting: quotes are rate-limited (1 req/sec), swap-instructions use burst mode (no limit)
+   - Idle logic: No fundable plans → long sleep; Fundable but no quotes → backoff (anomaly); Quotes called → short sleep
+
+3. **Live execution** (`trader.py::execute_prepared_bundle`)
+   - Uses `PreparedBundle` with exact signed VT that was simulated (proof→action guarantee)
+   - Expiry check: Rebuild ONLY if `blocks_remaining <= EXPIRY_REBUILD_HEADROOM_BLOCKS` (default: 150 blocks ~30s)
+   - Otherwise: Use bundle VT directly (no rebuild, no re-fetching swap-instructions)
+   - Mandatory simulation of bundle VT (same VT, not new)
+   - Send transaction
 
 2. **Risk check** (`risk_manager.py`)
    - Checks all limits
@@ -277,15 +359,20 @@ src/
    - Controls active positions
 
 3. **Simulation** (`solana_client.py`)
+   - Builds atomic VersionedTransaction v0 for full 2-swap execution plan
+   - Uses Address Lookup Tables (ALTs) for transaction size optimization
    - Simulates transaction via RPC `simulateTransaction` before sending
-   - ⚠️ **Current limitation**: Only simulates first leg of cycle (first-leg proxy)
-   - Validates results (first leg output only)
+   - Validates results (full 2-swap atomic execution)
+   - **Negative cache** — TTL-based cache for size overflow and runtime 6024 errors
+   - **useSharedAccounts=False** — hard requirement (no retry with True)
 
 4. **Execution** (`trader.py`)
-   - Builds transaction via Jupiter Swap API (first leg only)
-   - ⚠️ **Current limitation**: Only executes first leg of cycle, not full multi-leg arbitrage
-   - Sends to network
+   - Builds atomic VersionedTransaction v0 for full 2-swap execution plan
+   - Uses Address Lookup Tables (ALTs) for transaction size optimization
+   - **Mandatory simulation** before execution
+   - Sends atomic transaction to network (all-or-nothing execution)
    - Waits for confirmation
+   - **useSharedAccounts=False** — hard requirement (no retry with True)
 
 ## Important Notes
 
@@ -298,10 +385,9 @@ src/
 
 ### Limitations
 
-- **⚠️ Simulation/live are not full-cycle arbitrage yet**: Current implementation is effectively first-leg proxy. The bot simulates/executes only the first swap (A → B) of the cycle (A → B → C → A), not the full multi-leg arbitrage. This is because Jupiter API doesn't support multi-leg swaps directly, and atomic multi-leg transactions are not yet implemented.
-- Cycles and tokens are loaded from `config.json` (repository default: 20 fixed 3-leg cycles, 6 tokens: SOL, USDC, JUP, BONK, WIF, RAY)
+- ⚠️ **Research prototype** — not production-ready, use at your own risk
+- ⚠️ **2-swap only** — currently supports 2-swap cross-AMM arbitrage (not 3-leg cycles)
 - Jupiter API rate limit: 60 requests/minute (configurable via `QUOTE_DELAY_SECONDS`)
-- Scan execution time: ~60 seconds per full pass + overhead (20 cycles × 3 requests = 60 requests with 1.0s delay)
 - RPC latency affects arbitrage success
 - MEV bots may outpace your transactions
 

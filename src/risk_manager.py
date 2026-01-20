@@ -61,7 +61,8 @@ class RiskManager:
             balances_by_mint: Dictionary mapping mint address to amount in smallest units
         """
         self.wallet_balances = balances_by_mint.copy()
-        logger.info(f"{colors['DIM']}Wallet balances updated!{colors['RESET']}")
+        # Log at DEBUG level to avoid spam (balances are updated frequently)
+        logger.debug(f"{colors['DIM']}Wallet balances updated!{colors['RESET']}")
     
     def get_available_balance(self, mint: str) -> int:
         """Get available balance for a specific mint (total - locked).

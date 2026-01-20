@@ -65,15 +65,3 @@ def jup_mint():
 def bonk_mint():
     """BONK mint address."""
     return "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-
-
-@pytest.fixture
-def sample_cycle_usdc(sol_mint, usdc_mint, jup_mint):
-    """Sample 3-leg cycle starting and ending in USDC."""
-    return [usdc_mint, sol_mint, jup_mint, usdc_mint]
-
-
-@pytest.fixture
-def sample_cycle_sol(sol_mint, usdc_mint, jup_mint):
-    """Sample 3-leg cycle starting and ending in SOL."""
-    return [sol_mint, usdc_mint, jup_mint, sol_mint]
