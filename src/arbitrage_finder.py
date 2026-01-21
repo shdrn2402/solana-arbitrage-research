@@ -764,7 +764,10 @@ class ArbitrageFinder:
                 # Skipped for 2-swap cross-AMM
                 
                 # 10) Build atomic VT (blockhash is fetched inside _build_atomic_cycle_vt)
-                # Note: Blockhash is fetched right before building VT to minimize time gap
+                # NOTE:
+                # - Blockhash is fetched as late as possible (inside VT build) to minimize time gap
+                # - In MODE=simulate we will also do an inline simulate here (research mode)
+                # - In MODE=live we treat this as BUILD-ONLY gate (no simulate here; final-gate sim is in execute_prepared_bundle)
                 vt, min_last_valid_block_height, fail_reason, fail_meta = await trader._build_atomic_cycle_vt(
                     opportunity, user_pubkey, leg_instructions=leg_instructions
                 )
@@ -780,34 +783,49 @@ class ArbitrageFinder:
                     stats['skips'].setdefault('vt_build_failed', 0)
                     stats['skips']['vt_build_failed'] += 1
                     continue  # SKIP
+
+                # 11) MODE-SPECIFIC handling:
+                # - MODE=simulate: full inline simulate (research mode)
+                # - MODE=live: BUILD-ONLY gate (no simulate here, final-gate sim in execute_prepared_bundle)
+                sim_result: Dict[str, Any]
+                if getattr(trader, "mode", "simulate") == "simulate":
+                    # INLINE SIMULATE (simulate mode only)
+                    sim_result = await trader.solana.simulate_versioned_transaction(vt)
+                    
+                    if sim_result is None:
+                        stats['skips'].setdefault('sim_rpc_none', 0)
+                        stats['skips']['sim_rpc_none'] += 1
+                        continue  # SKIP
+                    
+                    if not isinstance(sim_result, dict):
+                        stats['skips'].setdefault('sim_invalid_type', 0)
+                        stats['skips']['sim_invalid_type'] += 1
+                        continue  # SKIP
+                    
+                    if sim_result.get("err"):
+                        stats['skips'].setdefault('sim_err', 0)
+                        stats['skips']['sim_err'] += 1
+                        continue  # SKIP
+                    
+                    # SUCCESS (simulate mode): full build + simulate OK
+                    stats['successes'] += 1
+                    logger.info(
+                        f"{colors['GREEN']}✓ Inline simulation SUCCESS{colors['RESET']}: "
+                        f"{dex1}->{dex2} | "
+                        f"Profit: {colors['GREEN']}{profit_bps} bps (${profit_usd:.4f}){colors['RESET']}"
+                    )
+                else:
+                    # BUILD-ONLY SUCCESS (live mode): VT built and passed size/negative-cache gates
+                    # No simulateTransaction here – final-gate sim is executed in execute_prepared_bundle().
+                    sim_result = {}
+                    stats['successes'] += 1  # Count as build_ok for summary in live mode
+                    logger.info(
+                        f"{colors['GREEN']}Bundle prepared (build-only gate passed){colors['RESET']}: "
+                        f"{dex1}->{dex2} | "
+                        f"Profit: {colors['GREEN']}{profit_bps} bps (${profit_usd:.4f}){colors['RESET']}"
+                    )
                 
-                # 11) Simulate inline (blockhash should be fresh from step 10)
-                sim_result = await trader.solana.simulate_versioned_transaction(vt)
-                
-                if sim_result is None:
-                    stats['skips'].setdefault('sim_rpc_none', 0)
-                    stats['skips']['sim_rpc_none'] += 1
-                    continue  # SKIP
-                
-                if not isinstance(sim_result, dict):
-                    stats['skips'].setdefault('sim_invalid_type', 0)
-                    stats['skips']['sim_invalid_type'] += 1
-                    continue  # SKIP
-                
-                if sim_result.get("err"):
-                    stats['skips'].setdefault('sim_err', 0)
-                    stats['skips']['sim_err'] += 1
-                    continue  # SKIP
-                
-                # SUCCESS: create PreparedBundle and call callback
-                stats['successes'] += 1
-                logger.info(
-                    f"{colors['GREEN']}✓ Inline simulation SUCCESS{colors['RESET']}: "
-                    f"{dex1}->{dex2} | "
-                    f"Profit: {colors['GREEN']}{profit_bps} bps (${profit_usd:.4f}){colors['RESET']}"
-                )
-                
-                # Create PreparedBundle with fully signed VT (ready for immediate live execution)
+                # SUCCESS PATH (both modes): create PreparedBundle and call callback
                 from .trader import PreparedBundle  # Import here to avoid circular import
                 bundle = PreparedBundle(
                     opportunity=opportunity,

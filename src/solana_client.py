@@ -415,22 +415,45 @@ class SolanaClient:
         """
         Wait for transaction confirmation at 'processed' commitment level (fast, non-final).
         
+        NOTE: AsyncClient.confirm_transaction in current solana-py does NOT support a timeout kwarg.
+        We implement timeout via asyncio.wait_for(), and treat API/transport errors separately.
+        
         Args:
-            signature: Transaction signature
+            signature: Transaction signature (base58 string)
             timeout: Timeout in seconds (short, default 2.0)
         
         Returns:
             True if processed, False otherwise
         """
-        try:
-            result = await self.client.confirm_transaction(
+        from solana.rpc.commitment import Confirmed
+        from solana.rpc.core import UnconfirmedTxError
+        
+        async def _confirm():
+            # Newer solana-py confirm_transaction accepts: signature, commitment=..., sleep_seconds=...
+            return await self.client.confirm_transaction(
                 signature,
-                commitment="processed",
-                timeout=timeout
+                commitment=Confirmed
             )
-            return result.value[0].confirmation_status is not None
+        
+        try:
+            result = await asyncio.wait_for(_confirm(), timeout=timeout)
+            try:
+                value = result.value
+                # In solana-py 0.30+, value is a tuple (RpcResponse, RpcResponseContext)
+                status = getattr(value[0], "confirmation_status", None)
+            except Exception:
+                status = None
+            return status is not None
+        except asyncio.TimeoutError:
+            logger.debug(f"Transaction not processed within {timeout}s (asyncio timeout)")
+            return False
+        except UnconfirmedTxError:
+            # Explicit "not confirmed" from solana-py
+            logger.debug("Transaction not yet processed (UnconfirmedTxError)")
+            return False
         except Exception as e:
-            logger.debug(f"Transaction not processed within {timeout}s: {e}")
+            # Infrastructure / API mismatch
+            logger.error(f"Error confirming transaction (processed): {e}", exc_info=True)
             return False
     
     async def confirm_transaction(
@@ -442,23 +465,51 @@ class SolanaClient:
         """
         Wait for transaction confirmation.
         
+        NOTE: AsyncClient.confirm_transaction in current solana-py does NOT support a timeout kwarg.
+        We implement timeout via asyncio.wait_for(), and distinguish between:
+        - normal "not confirmed" (timeout / UnconfirmedTxError)
+        - infrastructure / API errors.
+        
         Args:
-            signature: Transaction signature
-            commitment: Commitment level
+            signature: Transaction signature (base58 string)
+            commitment: Commitment level (string, e.g. 'confirmed' or 'finalized')
             timeout: Timeout in seconds
         
         Returns:
             True if confirmed, False otherwise
         """
-        try:
-            result = await self.client.confirm_transaction(
+        from solana.rpc.commitment import Commitment
+        from solana.rpc.core import UnconfirmedTxError
+        
+        async def _confirm():
+            # Normalize commitment
+            try:
+                commitment_obj = Commitment(commitment)
+            except Exception:
+                commitment_obj = Commitment("confirmed")
+            return await self.client.confirm_transaction(
                 signature,
-                commitment=commitment,
-                timeout=timeout
+                commitment=commitment_obj
             )
-            return result.value[0].confirmation_status is not None
+        
+        try:
+            result = await asyncio.wait_for(_confirm(), timeout=timeout)
+            try:
+                value = result.value
+                status = getattr(value[0], "confirmation_status", None)
+            except Exception:
+                status = None
+            return status is not None
+        except asyncio.TimeoutError:
+            logger.warning(f"Transaction not confirmed within {timeout}s (asyncio timeout)")
+            return False
+        except UnconfirmedTxError:
+            # Explicit "not confirmed" from solana-py, not an infra error
+            logger.warning("Transaction not confirmed (UnconfirmedTxError)")
+            return False
         except Exception as e:
-            logger.error(f"Error confirming transaction: {e}")
+            # Infrastructure / API mismatch or other unexpected error
+            logger.error(f"Error confirming transaction: {e}", exc_info=True)
             return False
     
     async def get_address_lookup_table_accounts(

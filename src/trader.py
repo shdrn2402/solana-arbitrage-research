@@ -878,15 +878,16 @@ class Trader:
             if tx_sig is None:
                 return False, "Failed to send transaction", None
             
-            # Wait for confirmation
+            # Wait for confirmation (single confirm gate, no internal retries here)
             confirmed = await self.solana.confirm_transaction(tx_sig, timeout=30.0)
             
             if confirmed:
                 self.risk.update_position_status(position_id, 'completed')
                 return True, None, tx_sig
             else:
+                # Could be "not confirmed yet" or infrastructure error (see solana_client logging)
                 self.risk.update_position_status(position_id, 'failed')
-                return False, "Transaction not confirmed", tx_sig
+                return False, "Transaction not confirmed (see confirm logs for details)", tx_sig
             
         except Exception as e:
             logger.error(f"Error executing opportunity: {e}")
@@ -1032,7 +1033,7 @@ class Trader:
             if tx_sig is None:
                 return False, "Failed to send transaction", None
             
-            # Wait for confirmation
+            # Wait for confirmation (single confirm gate, no internal retries here)
             confirmed = await self.solana.confirm_transaction(tx_sig, timeout=30.0)
             
             if confirmed:
@@ -1041,8 +1042,9 @@ class Trader:
                     logger.info(f"{colors['YELLOW']}Transaction sent (after {rebuild_reason}){colors['RESET']}: {colors['CYAN']}{tx_sig}{colors['RESET']}")
                 return True, None, tx_sig
             else:
+                # Could be "not confirmed yet" or infrastructure error (distinguished by solana_client logs)
                 self.risk.update_position_status(position_id, 'failed')
-                return False, "Transaction not confirmed", tx_sig
+                return False, "Transaction not confirmed (see confirm logs for details)", tx_sig
             
         except Exception as e:
             logger.error(f"Error executing prepared bundle: {e}", exc_info=True)

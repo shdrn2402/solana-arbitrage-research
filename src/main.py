@@ -885,7 +885,15 @@ async def main(mode: str = 'scan'):
                 
                 # Inline arbitrage iteration (2-swap cross-AMM, atomic, enforced 1-hop)
                 async def on_success_callback(bundle, sim_result: Dict[str, Any]) -> None:
-                    """Callback for successful inline simulations with PreparedBundle."""
+                    """
+                    Callback for successful inline path with PreparedBundle.
+                    
+                    MODE=simulate:
+                        - Called after full inline simulate (build + simulate OK).
+                    MODE=live:
+                        - Called after BUILD-ONLY gate (VT built; no simulate yet).
+                        - Final-gate simulate+send is handled in trader.execute_prepared_bundle().
+                    """
                     from .trader import PreparedBundle  # Import here to avoid circular import
                     nonlocal usdc_units_last, t_usdc_last
                     
@@ -913,16 +921,30 @@ async def main(mode: str = 'scan'):
                                 risk_manager.update_wallet_balances(balances_by_mint)
                                 logger.debug(f"USDC balance refreshed: {usdc_units_last / 1e6:.2f} USDC")
                     
-                    # For live mode, execute using PreparedBundle (no rebuild)
+                    # For live mode, execute using PreparedBundle (no rebuild, except expiry_rebuild inside trader)
                     if mode == 'live':
                         try:
                             success, error_msg, tx_sig = await trader.execute_prepared_bundle(bundle, user_pubkey)
                             if success:
+                                # Final-gate simulation + send + confirm all succeeded
+                                if hasattr(run_nonstop, '_live_metrics'):
+                                    run_nonstop._live_metrics['final_gate_sim_ok'] += 1
+                                    run_nonstop._live_metrics['sent'] += 1
+                                    run_nonstop._live_metrics['confirmed'] += 1
                                 logger.info(
                                     f"{colors['GREEN']}✓ Execution SUCCESS{colors['RESET']}: "
                                     f"{cycle_display} | TX: {colors['CYAN']}{tx_sig}{colors['RESET']}"
                                 )
                             else:
+                                # Final-gate failed: try to classify as sim_fail vs send/confirm fail
+                                if hasattr(run_nonstop, '_live_metrics'):
+                                    if error_msg and "Simulation failed" in error_msg:
+                                        run_nonstop._live_metrics['final_gate_sim_fail'] += 1
+                                    elif error_msg and (
+                                        "Transaction not confirmed" in error_msg
+                                        or "Failed to send transaction" in error_msg
+                                    ):
+                                        run_nonstop._live_metrics['sent'] += 1
                                 logger.warning(f"Execution failed: {error_msg}")
                         except Exception as e:
                             logger.error(f"Error executing prepared bundle: {e}", exc_info=True)
@@ -939,10 +961,19 @@ async def main(mode: str = 'scan'):
                 if not hasattr(run_nonstop, '_cumulative_stats'):
                     run_nonstop._cumulative_stats = {
                         'candidates': 0,
+                        # In simulate mode: full inline simulate successes
+                        # In live mode: build-only gate successes (PreparedBundle built)
                         'successes': 0,
                         'skips': {},
                         'errors': 0,
                         'iterations': 0
+                    }
+                    # Live-mode execution metrics (final-gate)
+                    run_nonstop._live_metrics = {
+                        'final_gate_sim_ok': 0,
+                        'final_gate_sim_fail': 0,
+                        'sent': 0,
+                        'confirmed': 0
                     }
                     run_nonstop._last_summary_time = time.monotonic()
                 
@@ -962,14 +993,28 @@ async def main(mode: str = 'scan'):
                     # Log summary
                     cum = run_nonstop._cumulative_stats
                     skip_summary = ', '.join([f"{k}:{v}" for k, v in sorted(cum['skips'].items()) if v > 0])
-                    logger.info(
+                    
+                    base_summary = (
                         f"{colors['DIM']}Summary ({cum['iterations']} iterations): "
                         f"{colors['CYAN']}{cum['candidates']}{colors['RESET']} candidates, "
                         f"{colors['GREEN']}{cum['successes']}{colors['RESET']} successes, "
                         f"{colors['YELLOW']}{cum['errors']}{colors['RESET']} errors"
                         + (f" | Skips: {skip_summary}" if skip_summary else "")
                     )
-                    # Reset cumulative stats
+                    
+                    # In live mode, append final-gate metrics
+                    if mode == 'live' and hasattr(run_nonstop, '_live_metrics'):
+                        lm = run_nonstop._live_metrics
+                        live_part = (
+                            f" | Final-gate: sim_ok={lm['final_gate_sim_ok']}, "
+                            f"sim_fail={lm['final_gate_sim_fail']}, "
+                            f"sent={lm['sent']}, confirmed={lm['confirmed']}"
+                        )
+                        logger.info(base_summary + live_part)
+                    else:
+                        logger.info(base_summary)
+                    
+                    # Reset cumulative stats (iteration-level)
                     run_nonstop._cumulative_stats = {
                         'candidates': 0,
                         'successes': 0,
@@ -977,6 +1022,7 @@ async def main(mode: str = 'scan'):
                         'errors': 0,
                         'iterations': 0
                     }
+                    # Live metrics are cumulative over process lifetime; do NOT reset here
                     run_nonstop._last_summary_time = t_now
                 
                 # Cleanup negative cache (periodic)

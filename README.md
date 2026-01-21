@@ -2,9 +2,40 @@
 
 Off-chain arbitrage research bot for Solana using the Jupiter Aggregator API for studying and evaluating arbitrage opportunities.
 
-## Project Status
+# ⚠️ Project Status: Archived (Research Prototype)
 
-This project is an experimental / research prototype developed iteratively.
+This repository contains a **research / exploration prototype** of a
+Jupiter-based atomic arbitrage bot.
+
+The project is **archived** and no longer actively developed.
+
+## Why it was archived
+
+During long-running simulations and live experiments, we identified
+fundamental architectural limitations:
+
+- Heavy reliance on Jupiter API (latency, rate limits, availability)
+- Polling-based quotes instead of real-time state
+- Transaction size constraints dominating success rate
+- Duplicate simulation layers in live mode
+- Poor scalability to graph-based (3-hop) arbitrage
+
+These limitations cannot be solved by incremental optimization and require
+a **different architecture**.
+
+## Successor project
+
+Active development continues in a new repository:
+
+➡️ **solana-ws-arb** (WebSocket-driven, Jito-first, graph-ready architecture)
+
+This repository is preserved for:
+- historical reference
+- experiments
+- reusable low-level components (Solana/Jito utils)
+
+No new features will be added here.
+
 
 ### ✅ Stage 1 — Scan (completed)
 - **Stable Jupiter API integration** — reliable quote retrieval via public API
@@ -338,20 +369,24 @@ src/
      - Get swap-instructions for both legs **in burst mode** (no rate limit for candidate-phase)
      - Build route_signature (cycle_mints, legs_count=2, useSharedAccounts=False, program_ids_fingerprint)
      - Negative-cache check (atomic_size_overflow) → SKIP if cached
-     - Build atomic VersionedTransaction v0 (already signed)
+     - Build atomic VersionedTransaction v0 (already signed; blockhash fetched as поздно, как возможно, внутри builder-а)
      - If size overflow → cache route (TTL 600s) → SKIP
-     - Simulate inline (no delays, no batches)
-     - On success → create `PreparedBundle` (with signed VT) → call callback
-   - Returns statistics: candidates, successes, skips (by reason), errors, had_fundable_plans, did_any_quote_call, did_candidate_flow
+     - **MODE=simulate**:
+       - Выполнить inline `simulateTransaction` (без задержек/батчей) — это исследовательский режим
+       - При успехе (err=None) → создать `PreparedBundle` (с подписанным VT) → вызвать callback
+     - **MODE=live**:
+       - НЕ вызывать `simulateTransaction` в inline-цикле (BUILD-ONLY gate)
+       - При успешной сборке VT (size/negative-cache пройдены) → создать `PreparedBundle` и передать его дальше в callback
+   - Возвращает статистику: `candidates`, `successes` (в simulate: успешные симуляции; в live: успешные BUILD-ONLY), `skips` (по причинам), `errors`, `had_fundable_plans`, `did_any_quote_call`, `did_candidate_flow`
    - Rate limiting: quotes are rate-limited (1 req/sec), swap-instructions use burst mode (no limit)
    - Idle logic: No fundable plans → long sleep; Fundable but no quotes → backoff (anomaly); Quotes called → short sleep
 
 3. **Live execution** (`trader.py::execute_prepared_bundle`)
-   - Uses `PreparedBundle` with exact signed VT that was simulated (proof→action guarantee)
+   - Принимает `PreparedBundle` с точно тем VT, который был собран в BUILD-ONLY gate (inline-цикл)
    - Expiry check: Rebuild ONLY if `blocks_remaining <= EXPIRY_REBUILD_HEADROOM_BLOCKS` (default: 150 blocks ~30s)
    - Otherwise: Use bundle VT directly (no rebuild, no re-fetching swap-instructions)
-   - Mandatory simulation of bundle VT (same VT, not new)
-   - Send transaction
+   - **Единственная симуляция в MODE=live**: mandatory `simulateTransaction` именно этого VT (или VT после `expiry_rebuild`)
+   - После успешной симуляции → отправка транзакции и ожидание подтверждения
 
 2. **Risk check** (`risk_manager.py`)
    - Checks all limits
